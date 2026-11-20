@@ -1,0 +1,1199 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import type { Pool } from "pg";
+import { attendanceClassScopePredicate, attendanceRecordScopePredicate, attendanceSessionScopePredicate, campusScopePredicate, boardingAssignmentScopePredicate, boardingBedScopePredicate, boardingDormitoryScopePredicate, boardingRoomScopePredicate, boardingStudentRecordScopePredicate, boardingStudentScopePredicate, hasTenantWideOperationalAccess, loadTenantContext, studentScopePredicate } from "./tenant-access.js";
+
+type Field = { column: string; kind?: "text" | "date" | "uuid" | "number" | "boolean" | "json" | "array" | "timestamp"; required?: boolean; max?: number; values?: string[]; minValue?: number; maxValue?: number; integer?: boolean };
+type Resource = { table: string; permission: string; writePermission?: string; fields: Record<string, Field>; order?: string; limit?: number; actorColumn?: string };
+type Json = Record<string, unknown>;
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
+const STUDENT_OPTIONS_READ_PERMISSIONS = new Set([
+  "academic.students.read",
+  "academic.enrollments.read",
+  "academic.attendance.read",
+  "boarding.rooms.manage",
+  "boarding.assignments.manage",
+  "boarding.leave.read",
+  "boarding.incidents.read",
+  "library.loans.read",
+  "library.loans.write",
+]);
+
+export function canReadStudentOptions(permissions: readonly string[]): boolean {
+  return permissions.some((permission) => STUDENT_OPTIONS_READ_PERMISSIONS.has(permission));
+}
+
+const GUARDIAN_AUTHORITY_PERMISSION = "academic.students.guardians.verify";
+const RESTRICTED_GUARDIAN_AUTHORITY_FIELDS = [
+  "is_legal_guardian",
+  "can_pickup_student",
+  "verification_note",
+  "verified_at",
+  "verified_by",
+] as const;
+
+function filterModuleRecordForPermissions(
+  resourceKey: string,
+  row: Record<string, unknown>,
+  permissions: readonly string[],
+): Record<string, unknown> {
+  const visible = { ...row };
+  if (resourceKey === "student-guardians" && !permissions.includes(GUARDIAN_AUTHORITY_PERMISSION)) {
+    for (const field of RESTRICTED_GUARDIAN_AUTHORITY_FIELDS) delete visible[field];
+  }
+  if (resourceKey === "hr-contracts" && !permissions.includes("hr.payroll.read")) {
+    delete visible.base_salary;
+    delete visible.currency_code;
+  }
+  return visible;
+}
+
+const RESOURCES: Record<string, Resource> = {
+  "campuses": { table: "core.campuses", permission: "academic.classes.read", writePermission: "core.campus.manage", fields: { code:{column:"code",required:true,max:32}, name:{column:"name",required:true,max:160}, campusType:{column:"campus_type",max:24,values:["main","branch","unit"]}, status:{column:"status",max:24,values:["active","inactive"]} } },
+  "student-details": { table: "academic.student_profiles", permission: "academic.students.read", writePermission: "academic.students.update", fields: { campusId:{column:"campus_id",kind:"uuid",required:true}, studentNumber:{column:"student_number",required:true,max:48}, legalName:{column:"legal_name",required:true,max:180}, preferredName:{column:"preferred_name",max:180}, birthDate:{column:"birth_date",kind:"date"}, birthPlace:{column:"birth_place",max:120}, genderCode:{column:"gender_code",max:24,values:["male","female","unspecified"]}, citizenshipCode:{column:"citizenship_code",max:2}, nationalStudentNumber:{column:"national_student_number",max:32}, entryDate:{column:"entry_date",kind:"date"}, previousSchoolName:{column:"previous_school_name",max:180}, currentAddress:{column:"current_address",kind:"json"}, permanentAddress:{column:"permanent_address",kind:"json"}, primaryPhone:{column:"primary_phone",max:32}, primaryEmail:{column:"primary_email",max:254}, photoObjectKey:{column:"photo_object_key",max:512}, status:{column:"status",max:24,values:["applicant","active","graduated","withdrawn","suspended"]} } },
+  "instructor-profiles": { table: "academic.instructors", permission: "hr.educators.read", writePermission: "hr.educators.write", fields: { employeeId:{column:"employee_id",kind:"uuid",required:true}, educatorNumber:{column:"educator_number",max:48}, educatorType:{column:"educator_type",required:true,max:24,values:["teacher","ustadz","musyrif","lecturer","trainer","counselor","other"]}, highestQualification:{column:"highest_qualification",max:120}, specialization:{column:"specialization",max:240}, certificationSummary:{column:"certification_summary",max:2000}, teachingExperienceYears:{column:"teaching_experience_years",kind:"number",minValue:0,maxValue:80}, employmentCategory:{column:"employment_category",max:80}, isActive:{column:"is_active",kind:"boolean"} } },
+  "employee-assignments": { table: "hr.employee_assignments", permission: "hr.organization.read", writePermission: "hr.organization.write", fields: { employeeId:{column:"employee_id",kind:"uuid",required:true}, departmentId:{column:"department_id",kind:"uuid"}, positionId:{column:"position_id",kind:"uuid"}, managerEmployeeId:{column:"manager_employee_id",kind:"uuid"}, assignmentType:{column:"assignment_type",max:24,values:["primary","secondary","acting","project","temporary"]}, startsOn:{column:"starts_on",kind:"date",required:true}, endsOn:{column:"ends_on",kind:"date"}, isPrimary:{column:"is_primary",kind:"boolean"}, decisionReference:{column:"decision_reference",max:160} } },
+  "academic-years": { table: "academic.academic_years", permission: "academic.classes.read", writePermission: "academic.classes.write", fields: { code:{column:"code",required:true,max:32}, name:{column:"name",required:true,max:120}, startsOn:{column:"starts_on",kind:"date",required:true}, endsOn:{column:"ends_on",kind:"date",required:true}, status:{column:"status",max:24,values:["planned","active","closed"]} } },
+  "academic-terms": { table: "academic.academic_terms", permission: "academic.classes.read", writePermission: "academic.classes.write", fields: { academicYearId:{column:"academic_year_id",kind:"uuid",required:true}, code:{column:"code",required:true,max:32}, name:{column:"name",required:true,max:120}, startsOn:{column:"starts_on",kind:"date",required:true}, endsOn:{column:"ends_on",kind:"date",required:true}, status:{column:"status",max:24,values:["planned","active","closed"]} } },
+  "programs": { table: "academic.programs", permission: "academic.classes.read", writePermission: "academic.classes.write", fields: { code:{column:"code",required:true,max:32}, name:{column:"name",required:true,max:120}, description:{column:"description",max:1000}, status:{column:"status",max:24,values:["active","inactive"]} } },
+  "subjects": { table: "academic.subjects", permission: "academic.classes.read", writePermission: "academic.classes.write", fields: { code:{column:"code",required:true,max:32}, name:{column:"name",required:true,max:120}, subjectType:{column:"subject_type",max:32,values:["general","religious","language","vocational","other"]}, status:{column:"status",max:24,values:["active","inactive"]} } },
+  "classes": { table: "academic.class_groups", permission: "academic.classes.read", writePermission: "academic.classes.write", fields: { campusId:{column:"campus_id",kind:"uuid",required:true}, academicYearId:{column:"academic_year_id",kind:"uuid",required:true}, programId:{column:"program_id",kind:"uuid",required:true}, code:{column:"code",required:true,max:32}, name:{column:"name",required:true,max:120}, capacity:{column:"capacity",kind:"number",minValue:1,integer:true}, status:{column:"status",max:24,values:["active","inactive"]} } },
+  "enrollments": { table: "academic.enrollments", permission: "academic.enrollments.read", writePermission: "academic.enrollments.write", fields: { studentId:{column:"student_id",kind:"uuid",required:true}, academicYearId:{column:"academic_year_id",kind:"uuid",required:true}, classGroupId:{column:"class_group_id",kind:"uuid"}, enrolledOn:{column:"enrolled_on",kind:"date"}, endedOn:{column:"ended_on",kind:"date"}, status:{column:"status",max:24,values:["enrolled","completed","transferred","withdrawn"]} } },
+  "attendance-sessions": { table: "academic.attendance_sessions", actorColumn: "recorded_by", permission: "academic.attendance.read", writePermission: "academic.attendance.write", fields: { classGroupId:{column:"class_group_id",kind:"uuid",required:true}, sessionDate:{column:"session_date",kind:"date",required:true}, sessionLabel:{column:"session_label",max:80}, status:{column:"status",max:24,values:["open"]} } },
+  "attendance-records": { table: "academic.attendance_records", order: "recorded_at", permission: "academic.attendance.read", writePermission: "academic.attendance.write", fields: { attendanceSessionId:{column:"attendance_session_id",kind:"uuid",required:true}, studentId:{column:"student_id",kind:"uuid",required:true}, attendanceStatus:{column:"attendance_status",required:true,max:24,values:["present","excused","sick","absent","late"]}, note:{column:"note",max:500} } },
+  "dormitories": { table: "boarding.dormitories", permission: "boarding.rooms.manage", fields: { campusId:{column:"campus_id",kind:"uuid"}, dormitoryCode:{column:"dormitory_code",required:true,max:32}, dormitoryName:{column:"dormitory_name",required:true,max:120}, genderPolicy:{column:"gender_policy",required:true,max:24,values:["male","female","mixed"]}, isActive:{column:"is_active",kind:"boolean"} } },
+  "boarding-rooms": { table: "boarding.rooms", order: "id", permission: "boarding.rooms.manage", fields: { dormitoryId:{column:"dormitory_id",kind:"uuid",required:true}, roomCode:{column:"room_code",required:true,max:32}, floorLabel:{column:"floor_label",max:40}, capacity:{column:"capacity",kind:"number",required:true,minValue:1,maxValue:100,integer:true}, isActive:{column:"is_active",kind:"boolean"} } },
+  "boarding-beds": { table: "boarding.beds", order: "id", permission: "boarding.rooms.manage", fields: { roomId:{column:"room_id",kind:"uuid",required:true}, bedCode:{column:"bed_code",required:true,max:32}, bedStatus:{column:"bed_status",max:24,values:["available"]} } },
+  "boarding-assignments": { table: "boarding.bed_assignments", actorColumn: "assigned_by", permission: "boarding.assignments.manage", fields: { bedId:{column:"bed_id",kind:"uuid",required:true}, studentId:{column:"student_id",kind:"uuid",required:true}, assignedFrom:{column:"assigned_from",kind:"date",required:true}, assignedUntil:{column:"assigned_until",kind:"date"} } },
+  "leave-requests": { table: "boarding.leave_requests", permission: "boarding.leave.read", writePermission: "boarding.leave.decide", fields: { studentId:{column:"student_id",kind:"uuid",required:true}, requestedFrom:{column:"requested_from",kind:"timestamp",required:true}, requestedUntil:{column:"requested_until",kind:"timestamp",required:true}, destination:{column:"destination",max:240}, reason:{column:"reason",required:true,max:1000} } },
+  "incidents": { table: "boarding.incidents", actorColumn: "recorded_by", permission: "boarding.incidents.read", writePermission: "boarding.incidents.write", fields: { studentId:{column:"student_id",kind:"uuid",required:true}, incidentType:{column:"incident_type",required:true,max:80,values:["guidance","discipline","safety","health_referral","other"]}, severity:{column:"severity",required:true,max:24,values:["low","medium","high","critical"]}, description:{column:"description",required:true,max:2000}, occurredAt:{column:"occurred_at",kind:"timestamp",required:true} } },
+  "library-catalog": { table: "library.catalog_items", permission: "library.catalog.read", writePermission: "library.catalog.write", fields: { isbn:{column:"isbn",max:24}, itemCode:{column:"item_code",required:true,max:48}, title:{column:"title",required:true,max:240}, subtitle:{column:"subtitle",max:240}, edition:{column:"edition",max:80}, authors:{column:"authors",kind:"array"}, publisher:{column:"publisher",max:160}, publicationYear:{column:"publication_year",kind:"number",minValue:1400,maxValue:2200,integer:true}, category:{column:"category",max:80}, languageCode:{column:"language_code",max:8}, isReferenceOnly:{column:"is_reference_only",kind:"boolean"}, isActive:{column:"is_active",kind:"boolean"} } },
+  "library-copies": { table: "library.copies", permission: "library.catalog.read", writePermission: "library.catalog.write", fields: { catalogItemId:{column:"catalog_item_id",kind:"uuid",required:true}, campusId:{column:"campus_id",kind:"uuid"}, barcode:{column:"barcode",required:true,max:64}, shelfLocation:{column:"shelf_location",max:80}, copyStatus:{column:"copy_status",max:24,values:["available"]}, acquiredOn:{column:"acquired_on",kind:"date"} } },
+  "library-loans": { table: "library.loans", actorColumn: "issued_by", permission: "library.loans.read", writePermission: "library.loans.write", fields: { copyId:{column:"copy_id",kind:"uuid",required:true}, borrowerType:{column:"borrower_type",required:true,max:24,values:["student"]}, borrowerId:{column:"borrower_id",kind:"uuid",required:true}, dueAt:{column:"due_at",kind:"timestamp",required:true} } },
+  "cms-pages": { table: "cms.pages", permission: "cms.pages.manage", fields: { campusId:{column:"campus_id",kind:"uuid"}, slug:{column:"slug",required:true,max:120}, title:{column:"title",required:true,max:240}, excerpt:{column:"excerpt",max:500}, bodyMarkdown:{column:"body_markdown",required:true,max:30000}, pageStatus:{column:"page_status",max:24,values:["draft"]}, seoTitle:{column:"seo_title",max:240}, seoDescription:{column:"seo_description",max:320} } },
+  "announcements": { table: "cms.announcements", permission: "cms.announcements.manage", fields: { campusId:{column:"campus_id",kind:"uuid"}, title:{column:"title",required:true,max:240}, summary:{column:"summary",max:500}, bodyMarkdown:{column:"body_markdown",required:true,max:12000}, audience:{column:"audience",required:true,max:24,values:["public","parents","students","staff","internal"]}, announcementStatus:{column:"announcement_status",max:24,values:["draft"]}, publishAt:{column:"publish_at",kind:"timestamp"}, expireAt:{column:"expire_at",kind:"timestamp"} } },
+  "contacts": { table: "crm.contacts", permission: "crm.contacts.read", writePermission: "crm.contacts.write", fields: { contactType:{column:"contact_type",required:true,max:32,values:["guardian","alumni","donor","partner","prospect","other"]}, displayName:{column:"display_name",required:true,max:180}, email:{column:"email",max:254}, phone:{column:"phone",max:32}, organizationName:{column:"organization_name",max:180}, consentStatus:{column:"consent_status",required:true,max:24,values:["unknown"]} } },
+  "interactions": { table: "crm.interactions", actorColumn: "recorded_by", permission: "crm.contacts.read", writePermission: "crm.contacts.write", fields: { contactId:{column:"contact_id",kind:"uuid",required:true}, channel:{column:"channel",required:true,max:32,values:["phone","email","whatsapp","meeting","letter","other"]}, subject:{column:"subject",required:true,max:180}, notes:{column:"notes",max:2000}, interactionAt:{column:"interaction_at",kind:"timestamp"} } },
+  "donor-pledges": { table: "crm.donor_pledges", permission: "crm.donations.manage", fields: { contactId:{column:"contact_id",kind:"uuid",required:true}, pledgeReference:{column:"pledge_reference",required:true,max:64}, pledgedAmount:{column:"pledged_amount",kind:"number",required:true,minValue:0.01}, currencyCode:{column:"currency_code",max:3}, pledgedOn:{column:"pledged_on",kind:"date"}, expectedOn:{column:"expected_on",kind:"date"}, pledgeStatus:{column:"pledge_status",max:24,values:["pledged"]}, notes:{column:"notes",max:1000} } },
+  "assets": { table: "assets.asset_register", permission: "assets.register.read", writePermission: "assets.register.write", fields: { campusId:{column:"campus_id",kind:"uuid"}, assetCode:{column:"asset_code",required:true,max:48}, assetName:{column:"asset_name",required:true,max:180}, category:{column:"category",required:true,max:80}, acquisitionDate:{column:"acquisition_date",kind:"date"}, acquisitionCost:{column:"acquisition_cost",kind:"number"}, usefulLifeMonths:{column:"useful_life_months",kind:"number",minValue:1,integer:true}, assetStatus:{column:"asset_status",max:24,values:["active"]}, locationLabel:{column:"location_label",max:180} } },
+  "suppliers": { table: "procurement.suppliers", permission: "procurement.suppliers.manage", fields: { supplierCode:{column:"supplier_code",required:true,max:48}, supplierName:{column:"supplier_name",required:true,max:180}, taxNumber:{column:"tax_number",max:40}, email:{column:"email",max:254}, phone:{column:"phone",max:32}, address:{column:"address",kind:"json"} } },
+  "purchase-requests": { table: "procurement.purchase_requests", actorColumn: "requested_by", permission: "procurement.requests.read", writePermission: "procurement.requests.write", fields: { campusId:{column:"campus_id",kind:"uuid"}, requestNumber:{column:"request_number",required:true,max:48}, requestDate:{column:"request_date",kind:"date",required:true}, requiredBy:{column:"required_by",kind:"date"}, purpose:{column:"purpose",required:true,max:1000} } },
+  "academic-class-subjects": { table: "academic.class_subjects", permission: "academic.classes.read", writePermission: "academic.classes.write", fields: { classGroupId:{column:"class_group_id",kind:"uuid",required:true}, subjectId:{column:"subject_id",kind:"uuid",required:true}, weeklyPeriods:{column:"weekly_periods",kind:"number",minValue:1,maxValue:30,integer:true} } },
+  "guardians": { table: "academic.guardians", permission: "academic.students.read", writePermission: "academic.students.create", fields: { displayName:{column:"display_name",required:true,max:180}, relationshipDefault:{column:"relationship_default",max:40}, phonePrimary:{column:"phone_primary",max:32}, phoneAlternate:{column:"phone_alternate",max:32}, email:{column:"email",max:254}, occupation:{column:"occupation",max:120}, address:{column:"address",kind:"json"}, preferredContactChannel:{column:"preferred_contact_channel",max:24,values:["whatsapp","phone","email","letter","none"]}, consentStatus:{column:"consent_status",max:24,values:["pending","granted","withdrawn","not_required"]} } },
+  "student-guardians": { table: "academic.student_guardians", permission: "academic.students.read", writePermission: "academic.students.update", fields: { studentId:{column:"student_id",kind:"uuid",required:true}, guardianId:{column:"guardian_id",kind:"uuid",required:true}, relationshipCode:{column:"relationship_code",required:true,max:40}, isPrimary:{column:"is_primary",kind:"boolean"}, isEmergencyContact:{column:"is_emergency_contact",kind:"boolean"}, validFrom:{column:"valid_from",kind:"date"}, validUntil:{column:"valid_until",kind:"date"} } },
+  "employees": { table: "hr.employees", permission: "hr.employees.read", writePermission: "hr.employees.write", fields: { campusId:{column:"campus_id",kind:"uuid"}, employeeNumber:{column:"employee_number",required:true,max:48}, legalName:{column:"legal_name",required:true,max:180}, preferredName:{column:"preferred_name",max:180}, email:{column:"email",max:254}, phone:{column:"phone",max:32}, joinedOn:{column:"joined_on",kind:"date",required:true}, employmentStatus:{column:"employment_status",max:24,values:["active","on_leave","resigned","terminated","retired"]} } },
+  "hr-departments": { table: "hr.departments", permission: "hr.organization.read", writePermission: "hr.organization.write", fields: { departmentCode:{column:"department_code",required:true,max:32}, departmentName:{column:"department_name",required:true,max:120}, parentDepartmentId:{column:"parent_department_id",kind:"uuid"}, headEmployeeId:{column:"head_employee_id",kind:"uuid"}, campusId:{column:"campus_id",kind:"uuid"}, effectiveFrom:{column:"effective_from",kind:"date"}, effectiveUntil:{column:"effective_until",kind:"date"}, isActive:{column:"is_active",kind:"boolean"} } },
+  "hr-positions": { table: "hr.positions", permission: "hr.organization.read", writePermission: "hr.organization.write", fields: { positionCode:{column:"position_code",required:true,max:32}, positionName:{column:"position_name",required:true,max:120}, departmentId:{column:"department_id",kind:"uuid"}, parentPositionId:{column:"parent_position_id",kind:"uuid"}, jobFamily:{column:"job_family",max:100}, positionLevel:{column:"position_level",kind:"number",minValue:1,maxValue:20,integer:true}, jobDescription:{column:"job_description",max:3000}, approvalScope:{column:"approval_scope",kind:"json"}, isActive:{column:"is_active",kind:"boolean"} } },
+  "hr-contracts": { table: "hr.employment_contracts", permission: "hr.contracts.read", writePermission: "hr.contracts.write", fields: { employeeId:{column:"employee_id",kind:"uuid",required:true}, positionId:{column:"position_id",kind:"uuid"}, contractType:{column:"contract_type",required:true,max:24,values:["permanent","fixed_term","part_time","honorary","volunteer"]}, startsOn:{column:"starts_on",kind:"date",required:true}, endsOn:{column:"ends_on",kind:"date"}, baseSalary:{column:"base_salary",kind:"number",required:true,minValue:0}, currencyCode:{column:"currency_code",max:3,values:["IDR"]}, status:{column:"status",max:24,values:["draft"]} } },
+  "hr-payroll-periods": { table: "hr.payroll_periods", permission: "hr.payroll.read", writePermission: "hr.payroll.prepare", fields: { periodCode:{column:"period_code",required:true,max:32}, startsOn:{column:"starts_on",kind:"date",required:true}, endsOn:{column:"ends_on",kind:"date",required:true}, payDate:{column:"pay_date",kind:"date",required:true}, status:{column:"status",max:16,values:["open"]} } },
+  "hr-payroll-runs": { table: "hr.payroll_runs", permission: "hr.payroll.read", writePermission: "hr.payroll.prepare", fields: { payrollPeriodId:{column:"payroll_period_id",kind:"uuid",required:true}, runNumber:{column:"run_number",required:true,max:48}, runType:{column:"run_type",max:24,values:["regular","bonus","adjustment"]}, status:{column:"status",max:24,values:["draft"]} } },
+  "purchase-request-lines": { table: "procurement.purchase_request_lines", order: "id", permission: "procurement.requests.read", writePermission: "procurement.requests.write", fields: { requestId:{column:"request_id",kind:"uuid",required:true}, description:{column:"description",required:true,max:500}, quantity:{column:"quantity",kind:"number",required:true,minValue:0.001}, estimatedUnitCost:{column:"estimated_unit_cost",kind:"number",minValue:0} } },
+  "purchase-order-lines": { table: "procurement.purchase_order_lines", order: "id", permission: "procurement.orders.manage", writePermission: "procurement.orders.manage", fields: { purchaseOrderId:{column:"purchase_order_id",kind:"uuid",required:true}, description:{column:"description",required:true,max:500}, quantity:{column:"quantity",kind:"number",required:true,minValue:0.001}, unitCost:{column:"unit_cost",kind:"number",required:true,minValue:0} } },
+  "asset-events": { table: "assets.asset_events", order: "occurred_at", actorColumn: "recorded_by", permission: "assets.register.read", writePermission: "assets.register.write", fields: { assetId:{column:"asset_id",kind:"uuid",required:true}, eventType:{column:"event_type",required:true,max:24,values:["assigned","moved","maintenance","disposed","status_changed","audited"]}, eventData:{column:"event_data",kind:"json"}, occurredAt:{column:"occurred_at",kind:"timestamp"} } },
+  "purchase-orders": { table: "procurement.purchase_orders", permission: "procurement.orders.manage", fields: { supplierId:{column:"supplier_id",kind:"uuid",required:true}, requestId:{column:"request_id",kind:"uuid"}, orderNumber:{column:"order_number",required:true,max:48}, orderedOn:{column:"ordered_on",kind:"date"}, expectedOn:{column:"expected_on",kind:"date"}, totalAmount:{column:"total_amount",kind:"number"} } }
+};
+
+/** Build a SQL projection only from server-owned resource metadata. Newly-added table columns stay private by default. */
+export function moduleRecordProjection(resource: Resource, permissions: readonly string[] = []): string {
+  const columns = new Set<string>(["id", "organization_id"]);
+  for (const field of Object.values(resource.fields)) {
+    if (resource.table === "hr.employment_contracts" &&
+        ["base_salary", "currency_code"].includes(field.column) &&
+        !permissions.includes("hr.payroll.read")) continue;
+    columns.add(field.column);
+  }
+  if (resource.actorColumn) columns.add(resource.actorColumn);
+  columns.add(resource.order ?? "created_at");
+  return [...columns].join(", ");
+}
+
+export function getModuleRecordProjection(resourceKey: string, permissions: readonly string[] = []): string | null {
+  const resource = RESOURCES[resourceKey];
+  return resource ? moduleRecordProjection(resource, permissions) : null;
+}
+
+function reply(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+  res.end(JSON.stringify(body));
+}
+async function readJson(req: IncomingMessage): Promise<Json | null> {
+  const chunks: Buffer[] = []; let size = 0;
+  for await (const chunk of req) { const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk); size += part.length; if (size > 32_768) return null; chunks.push(part); }
+  try { const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8")); return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Json : null; } catch { return null; }
+}
+function validDate(value: string): boolean {
+  if (!DATE.test(value)) return false;
+  const [y,m,d] = value.split("-").map(Number); const date = new Date(Date.UTC(y ?? 0,(m ?? 1)-1,d ?? 0));
+  return date.getUTCFullYear()===y && date.getUTCMonth()===(m ?? 1)-1 && date.getUTCDate()===d;
+}
+function validateAddress(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const allowed = new Set(["street", "rt", "rw", "village", "district", "city", "province", "postalCode", "countryCode"]);
+  for (const [key, part] of Object.entries(value as Record<string, unknown>)) {
+    if (!allowed.has(key) || typeof part !== "string") return false;
+    const max = key === "street" ? 240 : key === "countryCode" ? 2 : key === "postalCode" ? 16 : 100;
+    if (part.length > max) return false;
+    if (key === "countryCode" && part !== "" && !/^[A-Za-z]{2}$/.test(part)) return false;
+  }
+  return true;
+}
+function validate(fields: Resource["fields"], body: Json, partial = false): string | null {
+  for (const key of Object.keys(body)) if (!fields[key]) return "unsupported_field";
+  for (const [key, field] of Object.entries(fields)) {
+    const value = body[key];
+    if (!partial && field.required && (value === undefined || value === null || value === "")) return `required_${key}`;
+    if (value === undefined || value === null || value === "") continue;
+    if (field.kind === "uuid" && (typeof value !== "string" || !UUID.test(value))) return `invalid_${key}`;
+    if (field.kind === "date" && (typeof value !== "string" || !validDate(value))) return `invalid_${key}`;
+    if (field.kind === "timestamp" && (typeof value !== "string" || Number.isNaN(Date.parse(value)))) return `invalid_${key}`;
+    if (field.kind === "number" && (typeof value !== "number" || !Number.isFinite(value) || value < (field.minValue ?? 0) || (field.maxValue !== undefined && value > field.maxValue) || (field.integer && !Number.isInteger(value)))) return `invalid_${key}`;
+    if (field.kind === "boolean" && typeof value !== "boolean") return `invalid_${key}`;
+    if (field.kind === "array" && (!Array.isArray(value) || value.length > 30 || value.some((item) => typeof item !== "string" || item.length > 120))) return `invalid_${key}`;
+    if (field.kind === "json" && (typeof value !== "object" || Array.isArray(value))) return `invalid_${key}`;
+    if (field.kind === "json" && ["address", "currentAddress", "permanentAddress"].includes(key) && !validateAddress(value)) return `invalid_${key}`;
+    if ((!field.kind || field.kind === "text") && (typeof value !== "string" || value.length > (field.max ?? 500))) return `invalid_${key}`;
+    if (field.values && (typeof value !== "string" || !field.values.includes(value))) return `invalid_${key}`;
+  }
+  if (body.email && typeof body.email === "string" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) return "invalid_email";
+  if (body.startsOn && body.endsOn && String(body.startsOn) > String(body.endsOn)) return "invalid_date_range";
+  if (body.validFrom && body.validUntil && String(body.validUntil) < String(body.validFrom)) return "invalid_date_range";
+  if (body.birthDate && body.entryDate && String(body.entryDate) < String(body.birthDate)) return "invalid_student_lifecycle_dates";
+  if (body.opensAt && body.closesAt && Date.parse(String(body.opensAt)) >= Date.parse(String(body.closesAt))) return "invalid_date_range";
+  if (body.requestedFrom && body.requestedUntil && Date.parse(String(body.requestedUntil)) <= Date.parse(String(body.requestedFrom))) return "invalid_date_range";
+  if (body.orderedOn && body.expectedOn && String(body.expectedOn) < String(body.orderedOn)) return "invalid_date_range";
+  if (body.requestDate && body.requiredBy && String(body.requiredBy) < String(body.requestDate)) return "invalid_date_range";
+  if (body.assignedFrom && body.assignedUntil && String(body.assignedUntil) < String(body.assignedFrom)) return "invalid_date_range";
+  return null;
+}
+
+export function validateModuleRecordInput(resourceKey: string, body: Json): string | null {
+  const resource = RESOURCES[resourceKey];
+  if (!resource) return "module_resource_not_found";
+  return validate(resource.fields, body);
+}
+
+export function validateModuleRecordPatchInput(resourceKey: string, body: Json): string | null {
+  const resource = RESOURCES[resourceKey];
+  if (!resource) return "module_resource_not_found";
+  return validate(resource.fields, body, true);
+}
+
+async function handleLibraryLoanReturn(res: ServerResponse, pool: Pick<Pool, "query">, userId: string, organizationId: string, loanId: string): Promise<void> {
+  await pool.query("SAVEPOINT library_loan_return");
+  try {
+    const loanResult = await pool.query("SELECT id, copy_id, loan_status FROM library.loans WHERE organization_id=$1::uuid AND id=$2::uuid FOR UPDATE", [organizationId, loanId]);
+    if (!loanResult.rows.length) {
+      await pool.query("ROLLBACK TO SAVEPOINT library_loan_return");
+      await pool.query("RELEASE SAVEPOINT library_loan_return");
+      reply(res, 404, { error: "loan_not_found" }); return;
+    }
+    const loan = loanResult.rows[0] as { id: string; copy_id: string; loan_status: string };
+    if (loan.loan_status !== "open") {
+      await pool.query("ROLLBACK TO SAVEPOINT library_loan_return");
+      await pool.query("RELEASE SAVEPOINT library_loan_return");
+      reply(res, 409, { error: "loan_not_open" }); return;
+    }
+    const copyResult = await pool.query("SELECT id, copy_status FROM library.copies WHERE organization_id=$1::uuid AND id=$2::uuid FOR UPDATE", [organizationId, loan.copy_id]);
+    if (!copyResult.rows.length || (copyResult.rows[0] as { copy_status: string }).copy_status !== "on_loan") {
+      await pool.query("ROLLBACK TO SAVEPOINT library_loan_return");
+      await pool.query("RELEASE SAVEPOINT library_loan_return");
+      reply(res, 409, { error: "copy_not_on_loan" }); return;
+    }
+    const returned = await pool.query("UPDATE library.loans SET loan_status='returned', returned_at=now(), received_by=$1::uuid WHERE organization_id=$2::uuid AND id=$3::uuid AND loan_status='open' RETURNING id, organization_id, copy_id, borrower_type, borrower_id, checked_out_at, due_at, returned_at, loan_status, issued_by, received_by, created_at", [userId, organizationId, loanId]);
+    await pool.query("UPDATE library.copies SET copy_status='available' WHERE organization_id=$1::uuid AND id=$2::uuid", [organizationId, loan.copy_id]);
+    await pool.query("INSERT INTO audit.audit_events (organization_id, actor_user_id, action, resource_type, resource_id, metadata) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6::jsonb)", [organizationId, userId, "library.loan.return", "library.loans", loanId, JSON.stringify({ copyId: loan.copy_id })]);
+    await pool.query("RELEASE SAVEPOINT library_loan_return");
+    reply(res, 200, { data: returned.rows[0] });
+  } catch (reason) {
+    await pool.query("ROLLBACK TO SAVEPOINT library_loan_return").catch(() => undefined);
+    await pool.query("RELEASE SAVEPOINT library_loan_return").catch(() => undefined);
+    const code = typeof reason === "object" && reason !== null && "code" in reason ? String((reason as { code: unknown }).code) : "";
+    reply(res, code === "23503" ? 422 : 500, { error: code === "23503" ? "related_record_not_found_in_tenant" : "library_loan_return_failed" });
+  }
+}
+
+async function createLibraryLoan(res: ServerResponse, pool: Pick<Pool, "query">, userId: string, organizationId: string, body: Json): Promise<void> {
+  const error = validateModuleRecordInput("library-loans", body);
+  if (error) { reply(res, 422, { error }); return; }
+  const copyId = String(body.copyId), borrowerId = String(body.borrowerId), dueAt = String(body.dueAt);
+  await pool.query("SAVEPOINT library_loan_issue");
+  try {
+    const copyResult = await pool.query(`SELECT c.id, c.copy_status, ci.is_reference_only, ci.is_active
+      FROM library.copies c JOIN library.catalog_items ci ON ci.organization_id=c.organization_id AND ci.id=c.catalog_item_id
+      WHERE c.organization_id=$1::uuid AND c.id=$2::uuid FOR UPDATE OF c`, [organizationId, copyId]);
+    if (!copyResult.rows.length) {
+      await pool.query("ROLLBACK TO SAVEPOINT library_loan_issue"); await pool.query("RELEASE SAVEPOINT library_loan_issue");
+      reply(res, 404, { error: "library_copy_not_found" }); return;
+    }
+    const copy = copyResult.rows[0] as { copy_status: string; is_reference_only: boolean; is_active: boolean };
+    if (copy.copy_status !== "available" || copy.is_reference_only || !copy.is_active) {
+      await pool.query("ROLLBACK TO SAVEPOINT library_loan_issue"); await pool.query("RELEASE SAVEPOINT library_loan_issue");
+      reply(res, 409, { error: "library_copy_unavailable" }); return;
+    }
+    const borrower = await pool.query("SELECT id FROM academic.student_profiles WHERE organization_id=$1::uuid AND id=$2::uuid AND status='active'", [organizationId, borrowerId]);
+    if (!borrower.rows.length) {
+      await pool.query("ROLLBACK TO SAVEPOINT library_loan_issue"); await pool.query("RELEASE SAVEPOINT library_loan_issue");
+      reply(res, 422, { error: "active_student_borrower_required" }); return;
+    }
+    const updatedCopy = await pool.query("UPDATE library.copies SET copy_status='on_loan' WHERE organization_id=$1::uuid AND id=$2::uuid AND copy_status='available' RETURNING id", [organizationId, copyId]);
+    if (!updatedCopy.rows.length) {
+      await pool.query("ROLLBACK TO SAVEPOINT library_loan_issue"); await pool.query("RELEASE SAVEPOINT library_loan_issue");
+      reply(res, 409, { error: "library_copy_unavailable" }); return;
+    }
+    const loan = await pool.query("INSERT INTO library.loans (organization_id, copy_id, borrower_type, borrower_id, due_at, issued_by) VALUES ($1::uuid,$2::uuid,'student',$3::uuid,$4::timestamptz,$5::uuid) RETURNING id, organization_id, copy_id, borrower_type, borrower_id, checked_out_at, due_at, returned_at, loan_status, issued_by, received_by, created_at", [organizationId, copyId, borrowerId, dueAt, userId]);
+    const loanId = String((loan.rows[0] as { id: string }).id);
+    await pool.query("INSERT INTO audit.audit_events (organization_id, actor_user_id, action, resource_type, resource_id, metadata) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6::jsonb)", [organizationId, userId, "library.loan.issue", "library.loans", loanId, JSON.stringify({ copyId, borrowerType: "student", borrowerId })]);
+    await pool.query("RELEASE SAVEPOINT library_loan_issue");
+    reply(res, 201, { data: loan.rows[0] });
+  } catch (reason) {
+    await pool.query("ROLLBACK TO SAVEPOINT library_loan_issue").catch(() => undefined);
+    await pool.query("RELEASE SAVEPOINT library_loan_issue").catch(() => undefined);
+    const code = typeof reason === "object" && reason !== null && "code" in reason ? String((reason as { code: unknown }).code) : "";
+    reply(res, code === "23505" ? 409 : code === "23503" || code === "23514" ? 422 : 500, { error: code === "23505" ? "duplicate_record" : code === "23503" ? "related_record_not_found_in_tenant" : code === "23514" ? "record_constraint_rejected" : "library_loan_issue_failed" });
+  }
+}
+
+
+type HealthRow = {
+  [column: string]: any;
+  id: string; student_id: string; blood_group_ciphertext: Buffer | null;
+  allergy_data_ciphertext: Buffer | null; medical_history_ciphertext: Buffer | null;
+  medication_data_ciphertext: Buffer | null; emergency_instructions_ciphertext: Buffer | null;
+  encryption_key_version: string | null; created_at: Date; updated_at: Date; legal_name?: string;
+};
+
+function decodeAes256Key(encoded: string, configuredVersion: string | undefined): { key: Buffer; version: string } | null {
+  if (!/^[A-Za-z0-9+/]{43}=$/.test(encoded)) return null;
+  const key = Buffer.from(encoded, "base64");
+  if (key.length !== 32 || key.toString("base64") !== encoded) return null;
+  const version = configuredVersion ?? "v1";
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(version)) return null;
+  return { key, version };
+}
+
+function getStudentHealthKey(): { key: Buffer; version: string } | null {
+  return decodeAes256Key(
+    process.env.STUDENT_HEALTH_ENCRYPTION_KEY ?? "",
+    process.env.STUDENT_HEALTH_ENCRYPTION_KEY_VERSION,
+  );
+}
+
+function encryptHealthValue(value: unknown, key: Buffer): Buffer | null {
+  if (value === undefined || value === null || value === "") return null;
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(Buffer.from(JSON.stringify(value), "utf8")), cipher.final()]);
+  return Buffer.concat([Buffer.from([1]), iv, cipher.getAuthTag(), encrypted]);
+}
+
+function decryptHealthValue(value: Buffer | null, key: Buffer): unknown {
+  if (!value) return null;
+  if (value.length < 30 || value[0] !== 1) throw new Error("unsupported_health_ciphertext");
+  const iv = value.subarray(1, 13);
+  const tag = value.subarray(13, 29);
+  const ciphertext = value.subarray(29);
+  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+  return JSON.parse(plain) as unknown;
+}
+
+function serializeHealthRow(row: HealthRow, key: Buffer): Record<string, unknown> {
+  return {
+    id: row.id,
+    student_id: row.student_id,
+    legal_name: row.legal_name ?? null,
+    blood_group: decryptHealthValue(row.blood_group_ciphertext, key),
+    allergy_data: decryptHealthValue(row.allergy_data_ciphertext, key),
+    medical_history: decryptHealthValue(row.medical_history_ciphertext, key),
+    medication_data: decryptHealthValue(row.medication_data_ciphertext, key),
+    emergency_instructions: decryptHealthValue(row.emergency_instructions_ciphertext, key),
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+async function handleStudentHealthProfiles(
+  req: IncomingMessage, res: ServerResponse, pool: Pick<Pool, "query">,
+  userId: string, organizationId: string, url: URL
+): Promise<void> {
+  const tenant = await loadTenantContext(pool, userId, organizationId);
+  if (!tenant) { reply(res, 403, { error: "active_membership_required" }); return; }
+  if (!hasTenantWideOperationalAccess(tenant.roles)) {
+    reply(res, 403, { error: "restricted_student_data_requires_tenant_authority", message: "Akses dokumen identitas dan data kesehatan menunggu pengujian pembatasan scope khusus." }); return;
+  }
+  const write = req.method !== "GET";
+  const requiredPermission = write ? "academic.students.health.write" : "academic.students.health.read";
+  if (!tenant.permissions.includes(requiredPermission)) {
+    reply(res, 403, { error: "permission_required", permission: requiredPermission }); return;
+  }
+  const crypto = getStudentHealthKey();
+  if (!crypto) {
+    reply(res, 503, { error: "student_health_encryption_not_configured", required: "STUDENT_HEALTH_ENCRYPTION_KEY (base64-encoded 32-byte key)" }); return;
+  }
+  const keyVersion = crypto.version;
+  if (req.method === "GET") {
+    const studentId = url.searchParams.get("studentId");
+    if (studentId && !UUID.test(studentId)) { reply(res, 400, { error: "valid_student_id_required" }); return; }
+    const result = await pool.query<HealthRow>(
+      `SELECT hp.id, hp.student_id, hp.blood_group_ciphertext, hp.allergy_data_ciphertext,
+        hp.medical_history_ciphertext, hp.medication_data_ciphertext,
+        hp.emergency_instructions_ciphertext, hp.encryption_key_version,
+        hp.created_at, hp.updated_at, sp.legal_name
+       FROM academic.student_health_profiles hp
+       JOIN academic.student_profiles sp ON sp.organization_id=hp.organization_id AND sp.id=hp.student_id
+       WHERE hp.organization_id=$1::uuid AND ($2::uuid IS NULL OR hp.student_id=$2::uuid)
+       ORDER BY sp.legal_name LIMIT 200`,
+      [organizationId, studentId]
+    );
+    try {
+      for (const row of result.rows) {
+        if (row.encryption_key_version !== keyVersion) throw new Error("student_health_key_version_mismatch");
+      }
+      const data = result.rows.map(row => serializeHealthRow(row, crypto.key));
+      // Health records are restricted data: write an access event for every
+      // returned record before disclosing any decrypted value to the caller.
+      if (result.rows.length > 0) {
+        await pool.query(
+          `INSERT INTO audit.audit_events
+            (organization_id, actor_user_id, action, resource_type, resource_id, metadata)
+           SELECT $1::uuid, $2::uuid, 'student.health_profile.read',
+                  'academic.student_health_profiles', accessed.resource_id,
+                  jsonb_build_object('encryptionKeyVersion', $3::text, 'accessChannel', 'workspace')
+             FROM unnest($4::text[]) AS accessed(resource_id)`,
+          [organizationId, userId, keyVersion, result.rows.map(row => row.id)]
+        );
+      }
+      reply(res, 200, { data });
+    } catch {
+      // Fail closed: do not disclose decrypted health data when its access
+      // audit cannot be written or the configured key cannot decrypt it.
+      reply(res, 503, { error: "student_health_read_or_audit_failed" });
+    }
+    return;
+  }
+  if (req.method !== "POST" && req.method !== "PATCH") {
+    res.setHeader("allow", "GET, POST, PATCH"); reply(res, 405, { error: "method_not_allowed" }); return;
+  }
+  const body = await readJson(req);
+  if (!body) { reply(res, 400, { error: "invalid_json_or_body_too_large" }); return; }
+  const allowed = new Set(["studentId", "bloodGroup", "allergyData", "medicalHistory", "medicationData", "emergencyInstructions"]);
+  if (Object.keys(body).some(key => !allowed.has(key))) { reply(res, 422, { error: "unsupported_health_field" }); return; }
+  const bloodGroups = new Set(["A+","A-","B+","B-","AB+","AB-","O+","O-","unknown"]);
+  if (body.bloodGroup !== undefined && body.bloodGroup !== null && body.bloodGroup !== "" && !bloodGroups.has(String(body.bloodGroup))) {
+    reply(res, 422, { error: "invalid_blood_group" }); return;
+  }
+  const recordId = url.searchParams.get("id");
+  let studentId = typeof body.studentId === "string" ? body.studentId : "";
+  if (req.method === "PATCH") {
+    if (!recordId || !UUID.test(recordId)) { reply(res, 400, { error: "valid_record_id_required" }); return; }
+    const existing = await pool.query<{ student_id: string; encryption_key_version: string }>(
+      "SELECT student_id, encryption_key_version FROM academic.student_health_profiles WHERE organization_id=$1::uuid AND id=$2::uuid",
+      [organizationId, recordId]
+    );
+    if (!existing.rows.length) { reply(res, 404, { error: "record_not_found" }); return; }
+    if (studentId && studentId !== existing.rows[0]!.student_id) { reply(res, 422, { error: "student_id_immutable" }); return; }
+    if (existing.rows[0]!.encryption_key_version !== keyVersion) { reply(res, 503, { error: "student_health_key_version_mismatch" }); return; }
+    studentId = existing.rows[0]!.student_id;
+  }
+  if (!UUID.test(studentId)) { reply(res, 422, { error: "valid_student_id_required" }); return; }
+  const columns: Array<[string,string]> = [
+    ["bloodGroup","blood_group_ciphertext"],["allergyData","allergy_data_ciphertext"],
+    ["medicalHistory","medical_history_ciphertext"],["medicationData","medication_data_ciphertext"],
+    ["emergencyInstructions","emergency_instructions_ciphertext"]
+  ];
+  const submitted = columns.filter(([key]) => Object.prototype.hasOwnProperty.call(body, key));
+  if (req.method === "PATCH" && submitted.length === 0) { reply(res, 400, { error: "no_mutable_fields" }); return; }
+  const values = submitted.map(([key]) => encryptHealthValue(body[key], crypto.key));
+  await pool.query("SAVEPOINT student_health_write");
+  try {
+    let result;
+    if (req.method === "POST") {
+      const allColumns = columns;
+      const encrypted = allColumns.map(([key]) => encryptHealthValue(body[key], crypto.key));
+      result = await pool.query<HealthRow>(
+        `INSERT INTO academic.student_health_profiles
+          (organization_id, student_id, blood_group_ciphertext, allergy_data_ciphertext,
+           medical_history_ciphertext, medication_data_ciphertext, emergency_instructions_ciphertext, encryption_key_version)
+         VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (organization_id, student_id) DO UPDATE SET
+           blood_group_ciphertext=EXCLUDED.blood_group_ciphertext,
+           allergy_data_ciphertext=EXCLUDED.allergy_data_ciphertext,
+           medical_history_ciphertext=EXCLUDED.medical_history_ciphertext,
+           medication_data_ciphertext=EXCLUDED.medication_data_ciphertext,
+           emergency_instructions_ciphertext=EXCLUDED.emergency_instructions_ciphertext,
+           encryption_key_version=EXCLUDED.encryption_key_version, updated_at=now()
+         RETURNING id, student_id, blood_group_ciphertext, allergy_data_ciphertext, medical_history_ciphertext,
+           medication_data_ciphertext, emergency_instructions_ciphertext, encryption_key_version, created_at, updated_at`,
+        [organizationId, studentId, ...encrypted, keyVersion]
+      );
+    } else {
+      const sets = submitted.map(([, column], index) => `${column}=${index+1}`);
+      sets.push(`encryption_key_version=${submitted.length+1}`, "updated_at=now()");
+      result = await pool.query<HealthRow>(
+        `UPDATE academic.student_health_profiles SET ${sets.join(",")}
+         WHERE organization_id=${submitted.length+2}::uuid AND id=${submitted.length+3}::uuid
+         RETURNING id, student_id, blood_group_ciphertext, allergy_data_ciphertext, medical_history_ciphertext,
+           medication_data_ciphertext, emergency_instructions_ciphertext, encryption_key_version, created_at, updated_at`,
+        [...values, keyVersion, organizationId, recordId]
+      );
+    }
+    const row = result.rows[0];
+    if (!row) { await pool.query("ROLLBACK TO SAVEPOINT student_health_write"); await pool.query("RELEASE SAVEPOINT student_health_write"); reply(res,404,{error:"record_not_found"}); return; }
+    await pool.query(
+      "INSERT INTO audit.audit_events (organization_id, actor_user_id, action, resource_type, resource_id, metadata) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6::jsonb)",
+      [organizationId,userId,"student.health_profile.write","academic.student_health_profiles",row.id,JSON.stringify({ fields: submitted.map(([key]) => key), encryptionKeyVersion: keyVersion })]
+    );
+    await pool.query("RELEASE SAVEPOINT student_health_write");
+    reply(res, req.method === "POST" ? 201 : 200, { data: serializeHealthRow(row, crypto.key) });
+  } catch (reason) {
+    await pool.query("ROLLBACK TO SAVEPOINT student_health_write").catch(() => undefined);
+    await pool.query("RELEASE SAVEPOINT student_health_write").catch(() => undefined);
+    const code = typeof reason === "object" && reason !== null && "code" in reason ? String((reason as {code:unknown}).code) : "";
+    reply(res, code === "23503" ? 422 : code === "23505" ? 409 : 500, { error: code === "23503" ? "related_record_not_found_in_tenant" : code === "23505" ? "duplicate_record" : "student_health_write_failed" });
+  }
+}
+
+
+type StudentIdentityDocumentRow = {
+  [column: string]: any;
+  id: string; student_id: string; document_type: string;
+  document_number_ciphertext: Buffer; encryption_key_version: string;
+  issuer: string | null; issued_on: string | null; expires_on: string | null;
+  verified_at: Date | null; created_at: Date; legal_name?: string;
+};
+
+function getStudentIdentityKey(): { key: Buffer; version: string } | null {
+  return decodeAes256Key(
+    process.env.STUDENT_IDENTITY_ENCRYPTION_KEY ?? "",
+    process.env.STUDENT_IDENTITY_ENCRYPTION_KEY_VERSION,
+  );
+}
+
+function serializeStudentIdentityDocument(row: StudentIdentityDocumentRow, key: Buffer): Record<string, unknown> {
+  return {
+    id: row.id, student_id: row.student_id, legal_name: row.legal_name ?? null,
+    document_type: row.document_type,
+    document_number: decryptHealthValue(row.document_number_ciphertext, key),
+    issuer: row.issuer, issued_on: row.issued_on, expires_on: row.expires_on,
+    verified_at: row.verified_at, created_at: row.created_at
+  };
+}
+
+async function handleStudentIdentityDocuments(
+  req: IncomingMessage, res: ServerResponse, pool: Pick<Pool, "query">,
+  userId: string, organizationId: string, url: URL
+): Promise<void> {
+  const tenant = await loadTenantContext(pool, userId, organizationId);
+  if (!tenant) { reply(res, 403, { error: "active_membership_required" }); return; }
+  if (!hasTenantWideOperationalAccess(tenant.roles)) {
+    reply(res, 403, { error: "restricted_student_data_requires_tenant_authority", message: "Akses dokumen identitas dan data kesehatan menunggu pengujian pembatasan scope khusus." }); return;
+  }
+  const write = req.method !== "GET";
+  const requiredPermission = write ? "academic.students.identity.write" : "academic.students.identity.read";
+  if (!tenant.permissions.includes(requiredPermission)) {
+    reply(res, 403, { error: "permission_required", permission: requiredPermission }); return;
+  }
+  const crypto = getStudentIdentityKey();
+  if (!crypto) {
+    reply(res, 503, { error: "student_identity_encryption_not_configured", required: "STUDENT_IDENTITY_ENCRYPTION_KEY (base64-encoded 32-byte key)" }); return;
+  }
+  const keyVersion = crypto.version;
+  if (req.method === "GET") {
+    const studentId = url.searchParams.get("studentId");
+    if (studentId && !UUID.test(studentId)) { reply(res, 400, { error: "valid_student_id_required" }); return; }
+    const result = await pool.query<StudentIdentityDocumentRow>(
+      `SELECT d.id, d.student_id, d.document_type, d.document_number_ciphertext,
+        d.encryption_key_version, d.issuer, d.issued_on, d.expires_on, d.verified_at,
+        d.created_at, s.legal_name
+       FROM academic.student_identity_documents d
+       JOIN academic.student_profiles s ON s.organization_id=d.organization_id AND s.id=d.student_id
+       WHERE d.organization_id=$1::uuid AND ($2::uuid IS NULL OR d.student_id=$2::uuid)
+       ORDER BY s.legal_name, d.document_type LIMIT 200`,
+      [organizationId, studentId]
+    );
+    try {
+      for (const row of result.rows) if (row.encryption_key_version !== keyVersion) throw new Error("student_identity_key_version_mismatch");
+      const data = result.rows.map(row => serializeStudentIdentityDocument(row, crypto.key));
+      if (result.rows.length > 0) {
+        await pool.query(
+          `INSERT INTO audit.audit_events
+            (organization_id, actor_user_id, action, resource_type, resource_id, metadata)
+           SELECT $1::uuid, $2::uuid, 'student.identity_document.read',
+                  'academic.student_identity_documents', accessed.resource_id,
+                  jsonb_build_object('encryptionKeyVersion', $3::text, 'accessChannel', 'workspace')
+             FROM unnest($4::text[]) AS accessed(resource_id)`,
+          [organizationId, userId, keyVersion, result.rows.map(row => row.id)]
+        );
+      }
+      reply(res, 200, { data });
+    } catch {
+      reply(res, 503, { error: "student_identity_read_or_audit_failed" });
+    }
+    return;
+  }
+  if (req.method !== "POST" && req.method !== "PATCH") {
+    res.setHeader("allow", "GET, POST, PATCH"); reply(res, 405, { error: "method_not_allowed" }); return;
+  }
+  const body = await readJson(req);
+  if (!body) { reply(res, 400, { error: "invalid_json_or_body_too_large" }); return; }
+  const allowed = new Set(["studentId", "documentType", "documentNumber", "issuer", "issuedOn", "expiresOn"]);
+  if (Object.keys(body).some(key => !allowed.has(key))) { reply(res, 422, { error: "unsupported_identity_document_field" }); return; }
+  const types = new Set(["nik", "kk", "nisn", "passport", "birth_certificate", "other"]);
+  if (body.documentType !== undefined && !types.has(String(body.documentType))) { reply(res, 422, { error: "invalid_document_type" }); return; }
+  if (body.documentNumber !== undefined && (typeof body.documentNumber !== "string" || body.documentNumber.trim().length < 1 || body.documentNumber.length > 128)) {
+    reply(res, 422, { error: "invalid_document_number" }); return;
+  }
+  if (body.issuer !== undefined && body.issuer !== null && (typeof body.issuer !== "string" || body.issuer.length > 180)) { reply(res, 422, { error: "invalid_issuer" }); return; }
+  for (const key of ["issuedOn", "expiresOn"]) if (body[key] !== undefined && body[key] !== null && body[key] !== "" && (typeof body[key] !== "string" || !validDate(body[key] as string))) {
+    reply(res, 422, { error: `invalid_${key}` }); return;
+  }
+  const issuedOn = typeof body.issuedOn === "string" ? body.issuedOn : null;
+  const expiresOn = typeof body.expiresOn === "string" ? body.expiresOn : null;
+  if (issuedOn && expiresOn && expiresOn < issuedOn) { reply(res, 422, { error: "expiry_before_issue_date" }); return; }
+  const recordId = url.searchParams.get("id");
+  await pool.query("SAVEPOINT student_identity_write");
+  try {
+    let result;
+    if (req.method === "POST") {
+      const studentId = typeof body.studentId === "string" ? body.studentId : "";
+      if (!UUID.test(studentId)) { await pool.query("ROLLBACK TO SAVEPOINT student_identity_write"); await pool.query("RELEASE SAVEPOINT student_identity_write"); reply(res, 422, { error: "valid_student_id_required" }); return; }
+      if (!types.has(String(body.documentType)) || typeof body.documentNumber !== "string" || !body.documentNumber.trim()) {
+        await pool.query("ROLLBACK TO SAVEPOINT student_identity_write"); await pool.query("RELEASE SAVEPOINT student_identity_write"); reply(res, 422, { error: "document_type_and_number_required" }); return;
+      }
+      const encrypted = encryptHealthValue(body.documentNumber.trim(), crypto.key);
+      result = await pool.query<StudentIdentityDocumentRow>(
+        `INSERT INTO academic.student_identity_documents
+          (organization_id, student_id, document_type, document_number_ciphertext, encryption_key_version, issuer, issued_on, expires_on)
+         VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7::date,$8::date)
+         RETURNING id, student_id, document_type, document_number_ciphertext, encryption_key_version, issuer, issued_on, expires_on, verified_at, created_at`,
+        [organizationId, studentId, body.documentType, encrypted, keyVersion, body.issuer ?? null, issuedOn, expiresOn]
+      );
+    } else {
+      if (!recordId || !UUID.test(recordId)) { await pool.query("ROLLBACK TO SAVEPOINT student_identity_write"); await pool.query("RELEASE SAVEPOINT student_identity_write"); reply(res, 400, { error: "valid_record_id_required" }); return; }
+      const existing = await pool.query<{ encryption_key_version: string }>(
+        "SELECT encryption_key_version FROM academic.student_identity_documents WHERE organization_id=$1::uuid AND id=$2::uuid",
+        [organizationId, recordId]
+      );
+      if (!existing.rows.length) { await pool.query("ROLLBACK TO SAVEPOINT student_identity_write"); await pool.query("RELEASE SAVEPOINT student_identity_write"); reply(res, 404, { error: "record_not_found" }); return; }
+      if (existing.rows[0]!.encryption_key_version !== keyVersion) { await pool.query("ROLLBACK TO SAVEPOINT student_identity_write"); await pool.query("RELEASE SAVEPOINT student_identity_write"); reply(res, 503, { error: "student_identity_key_version_mismatch" }); return; }
+      const columns: Array<[string, string, unknown]> = [];
+      if (body.documentType !== undefined) columns.push(["document_type", "documentType", body.documentType]);
+      if (body.documentNumber !== undefined) columns.push(["document_number_ciphertext", "documentNumber", encryptHealthValue(body.documentNumber, crypto.key)]);
+      if (body.issuer !== undefined) columns.push(["issuer", "issuer", body.issuer]);
+      if (body.issuedOn !== undefined) columns.push(["issued_on", "issuedOn", issuedOn]);
+      if (body.expiresOn !== undefined) columns.push(["expires_on", "expiresOn", expiresOn]);
+      if (!columns.length) { await pool.query("ROLLBACK TO SAVEPOINT student_identity_write"); await pool.query("RELEASE SAVEPOINT student_identity_write"); reply(res, 400, { error: "no_mutable_fields" }); return; }
+      const sets = columns.map(([column], index) => `${column}=${index+1}`);
+      sets.push(`encryption_key_version=${columns.length+1}`);
+      result = await pool.query<StudentIdentityDocumentRow>(
+        `UPDATE academic.student_identity_documents SET ${sets.join(",")}
+         WHERE organization_id=${columns.length+2}::uuid AND id=${columns.length+3}::uuid
+         RETURNING id, student_id, document_type, document_number_ciphertext, encryption_key_version, issuer, issued_on, expires_on, verified_at, created_at`,
+        [...columns.map(([, , value]) => value), keyVersion, organizationId, recordId]
+      );
+    }
+    const row = result.rows[0];
+    if (!row) { await pool.query("ROLLBACK TO SAVEPOINT student_identity_write"); await pool.query("RELEASE SAVEPOINT student_identity_write"); reply(res, 404, { error: "record_not_found" }); return; }
+    await pool.query(
+      "INSERT INTO audit.audit_events (organization_id, actor_user_id, action, resource_type, resource_id, metadata) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6::jsonb)",
+      [organizationId, userId, "student.identity_document.write", "academic.student_identity_documents", row.id, JSON.stringify({ fields: req.method === "POST" ? ["documentType", "documentNumber", "issuer", "issuedOn", "expiresOn"] : Object.keys(body).filter(key => key !== "studentId"), encryptionKeyVersion: keyVersion })]
+    );
+    await pool.query("RELEASE SAVEPOINT student_identity_write");
+    reply(res, req.method === "POST" ? 201 : 200, { data: serializeStudentIdentityDocument(row, crypto.key) });
+  } catch (reason) {
+    await pool.query("ROLLBACK TO SAVEPOINT student_identity_write").catch(() => undefined);
+    await pool.query("RELEASE SAVEPOINT student_identity_write").catch(() => undefined);
+    const code = typeof reason === "object" && reason !== null && "code" in reason ? String((reason as {code:unknown}).code) : "";
+    reply(res, code === "23503" ? 422 : code === "23505" ? 409 : 500, { error: code === "23503" ? "related_record_not_found_in_tenant" : code === "23505" ? "duplicate_record" : "student_identity_write_failed" });
+  }
+}
+
+export async function handleModuleRecordsRequest(req: IncomingMessage, res: ServerResponse, pool: Pick<Pool, "query">, userId: string, organizationId: string): Promise<boolean> {
+  const url = new URL(req.url ?? "/", "http://localhost");
+  if (url.pathname === "/v1/modules/student-identity-documents") {
+    await handleStudentIdentityDocuments(req, res, pool, userId, organizationId, url);
+    return true;
+  }
+  if (url.pathname === "/v1/modules/student-health-profiles") {
+    await handleStudentHealthProfiles(req, res, pool, userId, organizationId, url);
+    return true;
+  }
+  const guardianVerifyMatch = url.pathname.match(/^\/v1\/modules\/student-guardians\/([0-9a-f-]{36})\/verify$/i);
+  if (guardianVerifyMatch) {
+    if (req.method !== "POST") { res.setHeader("allow", "POST"); reply(res,405,{error:"method_not_allowed"}); return true; }
+    const tenant = await loadTenantContext(pool,userId,organizationId);
+    if (!tenant) { reply(res,403,{error:"active_membership_required"}); return true; }
+    if (!hasTenantWideOperationalAccess(tenant.roles)) { reply(res,403,{error:"guardian_authority_scope_not_supported"}); return true; }
+    if (!tenant.permissions.includes("academic.students.guardians.verify")) {
+      reply(res,403,{error:"permission_required",permission:"academic.students.guardians.verify"}); return true;
+    }
+    const relationId = guardianVerifyMatch[1] ?? "";
+    if (!UUID.test(relationId)) { reply(res,400,{error:"valid_record_id_required"}); return true; }
+    const body = await readJson(req);
+    if (!body) { reply(res,400,{error:"invalid_json_or_body_too_large"}); return true; }
+    if (Object.keys(body).some(key=>!["isLegalGuardian","canPickupStudent","verificationNote"].includes(key))) {
+      reply(res,422,{error:"unsupported_guardian_verification_field"}); return true;
+    }
+    if (typeof body.isLegalGuardian !== "boolean" || typeof body.canPickupStudent !== "boolean" ||
+        typeof body.verificationNote !== "string" || body.verificationNote.trim().length < 12 || body.verificationNote.length > 500) {
+      reply(res,422,{error:"guardian_verification_requires_explicit_authority_flags_and_evidence_note"}); return true;
+    }
+    await pool.query("SAVEPOINT guardian_authority_verify");
+    try {
+      const result = await pool.query(
+        `WITH updated AS (
+           UPDATE academic.student_guardians
+           SET is_legal_guardian=$1::boolean, can_pickup_student=$2::boolean,
+               verification_note=$3, verified_at=now(), verified_by=$4::uuid
+           WHERE organization_id=$5::uuid AND id=$6::uuid
+             AND valid_from<=CURRENT_DATE AND (valid_until IS NULL OR valid_until>=CURRENT_DATE)
+           RETURNING id, student_id, guardian_id, is_legal_guardian, can_pickup_student, is_emergency_contact,
+                     verified_at, verified_by, valid_from, valid_until
+         ), audited AS (
+           INSERT INTO audit.audit_events
+             (organization_id,actor_user_id,action,resource_type,resource_id,metadata)
+           SELECT $5::uuid,$4::uuid,'student.guardian.authority.verify',
+                  'academic.student_guardians',id::text,
+                  jsonb_build_object('isLegalGuardian',is_legal_guardian,
+                                     'canPickupStudent',can_pickup_student,
+                                     'evidenceNoteProvided',true)
+           FROM updated RETURNING id
+         )
+         SELECT updated.* FROM updated CROSS JOIN audited`,
+        [body.isLegalGuardian,body.canPickupStudent,body.verificationNote.trim(),userId,organizationId,relationId]
+      );
+      if (!result.rows[0]) {
+        await pool.query("ROLLBACK TO SAVEPOINT guardian_authority_verify");
+        await pool.query("RELEASE SAVEPOINT guardian_authority_verify");
+        reply(res,404,{error:"active_guardian_relationship_not_found"}); return true;
+      }
+      await pool.query("RELEASE SAVEPOINT guardian_authority_verify");
+      reply(res,200,{data:result.rows[0]});
+    } catch {
+      await pool.query("ROLLBACK TO SAVEPOINT guardian_authority_verify").catch(()=>undefined);
+      await pool.query("RELEASE SAVEPOINT guardian_authority_verify").catch(()=>undefined);
+      reply(res,503,{error:"guardian_authority_verification_failed"});
+    }
+    return true;
+  }
+  const returnMatch = url.pathname.match(/^\/v1\/modules\/library-loans\/([0-9a-f-]{36})\/return$/i);
+  if (returnMatch) {
+    if (req.method !== "POST") { res.setHeader("allow", "POST"); reply(res,405,{error:"method_not_allowed"}); return true; }
+    const tenant = await loadTenantContext(pool,userId,organizationId);
+    if (!tenant) { reply(res,403,{error:"active_membership_required"}); return true; }
+    if (!hasTenantWideOperationalAccess(tenant.roles)) { reply(res,403,{error:"library_loan_scope_not_supported"}); return true; }
+    if (!tenant.permissions.includes("library.loans.write")) { reply(res,403,{error:"permission_required",permission:"library.loans.write"}); return true; }
+    const loanId = returnMatch[1] ?? "";
+    if (!UUID.test(loanId)) { reply(res,400,{error:"valid_record_id_required"}); return true; }
+    await handleLibraryLoanReturn(res,pool,userId,organizationId,loanId);
+    return true;
+  }
+  const match = url.pathname.match(/^\/v1\/modules\/([a-z-]+)$/);
+  if (!match) return false;
+  if (req.method !== "GET" && req.method !== "POST" && req.method !== "PATCH") { res.setHeader("allow", "GET, POST, PATCH"); reply(res,405,{error:"method_not_allowed"}); return true; }
+  if (match[1] === "student-options") {
+    if (req.method !== "GET") { res.setHeader("allow","GET"); reply(res,405,{error:"method_not_allowed"}); return true; }
+    const tenant = await loadTenantContext(pool,userId,organizationId);
+    if (!tenant) { reply(res,403,{error:"active_membership_required"}); return true; }
+    const allowed = canReadStudentOptions(tenant.permissions);
+    if (!allowed) { reply(res,403,{error:"permission_required"}); return true; }
+    const tenantWide = hasTenantWideOperationalAccess(tenant.roles);
+    const result = await pool.query(
+      `SELECT sp.id, sp.student_number AS "studentNumber", sp.legal_name AS "legalName"
+       FROM academic.student_profiles sp
+       WHERE sp.organization_id=$1::uuid AND sp.status IN ('active','applicant')
+         AND ${studentScopePredicate("sp", "$1", "$2", "$3")}
+       ORDER BY sp.legal_name LIMIT 200`,
+      [organizationId, tenant.membershipId, tenantWide],
+    );
+    reply(res,200,{data:result.rows}); return true;
+  }
+  const resource = RESOURCES[match[1] ?? ""];
+  if (!resource) { reply(res,404,{error:"module_resource_not_found"}); return true; }
+  const tenant = await loadTenantContext(pool,userId,organizationId);
+  if (!tenant) { reply(res,403,{error:"active_membership_required"}); return true; }
+  const write = req.method !== "GET";
+  const requiredPermission = write ? (resource.writePermission ?? resource.permission) : resource.permission;
+  if (!tenant.permissions.includes(requiredPermission)) { reply(res,403,{error:"permission_required",permission:requiredPermission}); return true; }
+  const tenantWide = hasTenantWideOperationalAccess(tenant.roles);
+  const scopedAttendanceResource = match[1] === "attendance-sessions" || match[1] === "attendance-records";
+  const scopedBoardingResource = ["dormitories", "boarding-rooms", "boarding-beds", "boarding-assignments", "leave-requests", "incidents"].includes(match[1] ?? "");
+  const scopedCampusReadResource = ["purchase-requests", "purchase-request-lines", "purchase-orders", "purchase-order-lines", "assets", "asset-events"].includes(match[1] ?? "");
+  const scopedLibraryReadResource = ["library-catalog", "library-copies", "library-loans"].includes(match[1] ?? "");
+  // Procurement, asset and library reads have resource-specific scope joins.
+  // Purchase-request and request-line creates also authorize campus/request
+  // ownership in the INSERT statement; other writes remain tenant-authority-only.
+  if (!tenantWide && !scopedAttendanceResource && !scopedBoardingResource && !scopedCampusReadResource && !scopedLibraryReadResource) {
+    reply(res,403,{error:"module_scope_not_supported_for_member",resource:match[1]}); return true;
+  }
+  const scopedCampusCreateResource = ["purchase-requests", "purchase-request-lines"].includes(match[1] ?? "");
+  if (!tenantWide && write && (scopedLibraryReadResource || (scopedCampusReadResource && !scopedCampusCreateResource))) {
+    reply(res,403,{error:"module_write_scope_not_supported_for_member",resource:match[1]}); return true;
+  }
+  if (!tenantWide && write && scopedCampusCreateResource && req.method !== "POST") {
+    reply(res,403,{error:"module_write_scope_not_supported_for_member",resource:match[1]}); return true;
+  }
+  if (!write) {
+    const limitRaw=Number(url.searchParams.get("limit") ?? String(resource.limit ?? 100));
+    const limit=Number.isInteger(limitRaw)?Math.min(Math.max(limitRaw,1),200):100;
+    const projection = moduleRecordProjection(resource, tenant.permissions);
+    let result;
+    if (match[1] === "attendance-sessions") {
+      const qualifiedProjection = projection.split(",").map((column) => `ats.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM academic.attendance_sessions ats
+         WHERE ats.organization_id=$1::uuid
+           AND ${attendanceSessionScopePredicate("ats", "$1", "$2", "$3")}
+         ORDER BY ats.session_date DESC, ats.id LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "attendance-records") {
+      const qualifiedProjection = projection.split(",").map((column) => `ar.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM academic.attendance_records ar
+         JOIN academic.attendance_sessions ats
+           ON ats.organization_id=ar.organization_id AND ats.id=ar.attendance_session_id
+         WHERE ar.organization_id=$1::uuid
+           AND ${attendanceRecordScopePredicate("ar", "$1", "$2", "$3")}
+         ORDER BY ar.recorded_at DESC, ar.id LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "library-catalog") {
+      const qualifiedProjection = projection.split(",").map((column) => `li.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM library.catalog_items li
+         WHERE li.organization_id=$1::uuid
+         ORDER BY li.title, li.id LIMIT $2`,
+        [organizationId, limit],
+      );
+    } else if (match[1] === "library-copies") {
+      const qualifiedProjection = projection.split(",").map((column) => `cp.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM library.copies cp
+         WHERE cp.organization_id=$1::uuid
+           AND ${campusScopePredicate("cp", "$1", "$2", "$3")}
+         ORDER BY cp.barcode, cp.id LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "library-loans") {
+      const qualifiedProjection = projection.split(",").map((column) => `l.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM library.loans l
+         JOIN library.copies cp
+           ON cp.organization_id=l.organization_id AND cp.id=l.copy_id
+         JOIN academic.student_profiles sp
+           ON sp.organization_id=l.organization_id AND sp.id=l.borrower_id
+         WHERE l.organization_id=$1::uuid AND l.borrower_type='student'
+           AND ${campusScopePredicate("cp", "$1", "$2", "$3")}
+           AND ${studentScopePredicate("sp", "$1", "$2", "$3")}
+         ORDER BY l.created_at DESC, l.id LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "purchase-requests") {
+      const qualifiedProjection = projection.split(",").map((column) => `pr.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM procurement.purchase_requests pr
+         WHERE pr.organization_id=$1::uuid
+           AND ${campusScopePredicate("pr", "$1", "$2", "$3")}
+         ORDER BY pr.request_date DESC, pr.id LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "purchase-request-lines") {
+      const qualifiedProjection = projection.split(",").map((column) => `prl.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM procurement.purchase_request_lines prl
+         JOIN procurement.purchase_requests pr
+           ON pr.organization_id=prl.organization_id AND pr.id=prl.request_id
+         WHERE prl.organization_id=$1::uuid
+           AND ${campusScopePredicate("pr", "$1", "$2", "$3")}
+         ORDER BY prl.id LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "purchase-orders") {
+      const qualifiedProjection = projection.split(",").map((column) => `po.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM procurement.purchase_orders po
+         JOIN procurement.purchase_requests pr
+           ON pr.organization_id=po.organization_id AND pr.id=po.request_id
+         WHERE po.organization_id=$1::uuid AND po.request_id IS NOT NULL
+           AND ${campusScopePredicate("pr", "$1", "$2", "$3")}
+         ORDER BY po.ordered_on DESC, po.id LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "purchase-order-lines") {
+      const qualifiedProjection = projection.split(",").map((column) => `pol.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM procurement.purchase_order_lines pol
+         JOIN procurement.purchase_orders po
+           ON po.organization_id=pol.organization_id AND po.id=pol.purchase_order_id
+         JOIN procurement.purchase_requests pr
+           ON pr.organization_id=po.organization_id AND pr.id=po.request_id
+         WHERE pol.organization_id=$1::uuid AND po.request_id IS NOT NULL
+           AND ${campusScopePredicate("pr", "$1", "$2", "$3")}
+         ORDER BY pol.id LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "assets") {
+      const qualifiedProjection = projection.split(",").map((column) => `a.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM assets.asset_register a
+         WHERE a.organization_id=$1::uuid
+           AND ${campusScopePredicate("a", "$1", "$2", "$3")}
+         ORDER BY a.created_at DESC, a.id LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "asset-events") {
+      const qualifiedProjection = projection.split(",").map((column) => `ae.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM assets.asset_events ae
+         JOIN assets.asset_register a
+           ON a.organization_id=ae.organization_id AND a.id=ae.asset_id
+         WHERE ae.organization_id=$1::uuid
+           AND ${campusScopePredicate("a", "$1", "$2", "$3")}
+         ORDER BY ae.occurred_at DESC, ae.id LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "dormitories") {
+      const qualifiedProjection = projection.split(",").map((column) => `d.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM boarding.dormitories d
+         WHERE d.organization_id=$1::uuid AND ${boardingDormitoryScopePredicate("d", "$1", "$2", "$3")}
+         ORDER BY d.created_at DESC LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "boarding-rooms") {
+      const qualifiedProjection = projection.split(",").map((column) => `r.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM boarding.rooms r
+         WHERE r.organization_id=$1::uuid AND ${boardingRoomScopePredicate("r", "$1", "$2", "$3")}
+         ORDER BY r.id DESC LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "boarding-beds") {
+      const qualifiedProjection = projection.split(",").map((column) => `b.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM boarding.beds b
+         WHERE b.organization_id=$1::uuid AND ${boardingBedScopePredicate("b", "$1", "$2", "$3")}
+         ORDER BY b.id DESC LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "boarding-assignments") {
+      const qualifiedProjection = projection.split(",").map((column) => `ba.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM boarding.bed_assignments ba
+         WHERE ba.organization_id=$1::uuid AND ${boardingAssignmentScopePredicate("ba", "$1", "$2", "$3")}
+         ORDER BY ba.created_at DESC LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "leave-requests") {
+      const qualifiedProjection = projection.split(",").map((column) => `lr.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM boarding.leave_requests lr
+         WHERE lr.organization_id=$1::uuid AND ${boardingStudentRecordScopePredicate("lr", "$1", "$2", "$3")}
+         ORDER BY lr.created_at DESC LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else if (match[1] === "incidents") {
+      const qualifiedProjection = projection.split(",").map((column) => `i.${column.trim()}`).join(", ");
+      result = await pool.query(
+        `SELECT ${qualifiedProjection} FROM boarding.incidents i
+         WHERE i.organization_id=$1::uuid AND ${boardingStudentRecordScopePredicate("i", "$1", "$2", "$3")}
+         ORDER BY i.created_at DESC LIMIT $4`,
+        [organizationId, tenant.membershipId, tenantWide, limit],
+      );
+    } else {
+      result = await pool.query(`SELECT ${projection} FROM ${resource.table} WHERE organization_id=$1::uuid ORDER BY ${resource.order ?? "created_at"} DESC LIMIT $2`,[organizationId,limit]);
+    }
+    const data = result.rows.map((row) => filterModuleRecordForPermissions(match[1] ?? "", row as Record<string, unknown>, tenant.permissions));
+    reply(res,200,{data,pagination:{limit,returned:data.length}}); return true;
+  }
+  const body=await readJson(req);
+  if (!body) { reply(res,400,{error:"invalid_json_or_body_too_large"}); return true; }
+  const recordId=url.searchParams.get("id");
+  if (match[1] === "hr-contracts" &&
+      (Object.prototype.hasOwnProperty.call(body, "baseSalary") || Object.prototype.hasOwnProperty.call(body, "currencyCode")) &&
+      !tenant.permissions.includes("hr.payroll.prepare")) {
+    reply(res,403,{error:"compensation_permission_required",permission:"hr.payroll.prepare"}); return true;
+  }
+  if (req.method === "PATCH" && match[1] === "attendance-records" &&
+      (Object.prototype.hasOwnProperty.call(body, "attendanceSessionId") || Object.prototype.hasOwnProperty.call(body, "studentId"))) {
+    reply(res,422,{error:"attendance_relationship_fields_are_immutable"}); return true;
+  }
+  if (req.method === "PATCH" && match[1] === "attendance-sessions" &&
+      (Object.prototype.hasOwnProperty.call(body, "classGroupId") || Object.prototype.hasOwnProperty.call(body, "sessionDate"))) {
+    reply(res,422,{error:"attendance_session_class_and_date_are_immutable"}); return true;
+  }
+  if (req.method === "PATCH" && !tenantWide && match[1] === "dormitories" && Object.prototype.hasOwnProperty.call(body, "campusId")) {
+    reply(res,422,{error:"dormitory_campus_is_immutable_for_scoped_members"}); return true;
+  }
+  if (req.method === "PATCH" && !tenantWide && match[1] === "boarding-rooms" && Object.prototype.hasOwnProperty.call(body, "dormitoryId")) {
+    reply(res,422,{error:"room_dormitory_is_immutable_for_scoped_members"}); return true;
+  }
+  if (req.method === "PATCH" && !tenantWide && match[1] === "boarding-beds" && Object.prototype.hasOwnProperty.call(body, "roomId")) {
+    reply(res,422,{error:"bed_room_is_immutable_for_scoped_members"}); return true;
+  }
+  if (req.method === "PATCH" && match[1] === "boarding-assignments" &&
+      ["bedId", "studentId", "assignedFrom"].some((key) => Object.prototype.hasOwnProperty.call(body, key))) {
+    reply(res,422,{error:"boarding_assignment_relationship_and_start_are_immutable"}); return true;
+  }
+  if (req.method === "PATCH" && ["leave-requests", "incidents"].includes(match[1] ?? "") &&
+      Object.prototype.hasOwnProperty.call(body, "studentId")) {
+    reply(res,422,{error:"boarding_student_relationship_is_immutable"}); return true;
+  }
+  if (req.method === "PATCH") {
+    if (!recordId || !UUID.test(recordId)) { reply(res,400,{error:"valid_record_id_required"}); return true; }
+    const error=validate(resource.fields,body,true);
+    if (error) { reply(res,422,{error}); return true; }
+    const entries=Object.entries(resource.fields).filter(([key])=>Object.prototype.hasOwnProperty.call(body,key));
+    if (!entries.length) { reply(res,400,{error:"no_mutable_fields"}); return true; }
+    const sets=entries.map(([,field],i)=>{const kind=field.kind;const suffix=kind==="uuid"?"::uuid":kind==="date"?"::date":kind==="timestamp"?"::timestamptz":kind==="json"?"::jsonb":"";return `${field.column}=${i+1}${suffix}`;});
+    const values=entries.map(([key,field])=>field.kind==="json"?JSON.stringify(body[key]):body[key]);
+    values.push(organizationId,recordId);
+    let updateSql: string;
+    if (match[1] === "attendance-records") {
+      const orgPlaceholder = `$${values.length-1}`;
+      const membershipPlaceholder = `$${values.length+1}`;
+      const tenantWidePlaceholder = `$${values.length+2}`;
+      values.push(tenant.membershipId, tenantWide);
+      updateSql = `UPDATE academic.attendance_records AS ar SET ${sets.join(",")}
+        WHERE ar.organization_id=${orgPlaceholder}::uuid AND ar.id=$${values.length-2}::uuid
+          AND ${attendanceRecordScopePredicate("ar", orgPlaceholder, membershipPlaceholder, tenantWidePlaceholder)}
+        RETURNING ${moduleRecordProjection(resource, tenant.permissions)}`;
+    } else if (match[1] === "attendance-sessions") {
+      const orgPlaceholder = `$${values.length-1}`;
+      const membershipPlaceholder = `$${values.length+1}`;
+      const tenantWidePlaceholder = `$${values.length+2}`;
+      values.push(tenant.membershipId, tenantWide);
+      updateSql = `UPDATE academic.attendance_sessions AS ats SET ${sets.join(",")}
+        WHERE ats.organization_id=${orgPlaceholder}::uuid AND ats.id=$${values.length-2}::uuid
+          AND ${attendanceSessionScopePredicate("ats", orgPlaceholder, membershipPlaceholder, tenantWidePlaceholder)}
+        RETURNING ${moduleRecordProjection(resource, tenant.permissions)}`;
+    } else if (["dormitories", "boarding-rooms", "boarding-beds", "boarding-assignments", "leave-requests", "incidents"].includes(match[1] ?? "")) {
+      const configs: Record<string, { alias: string; predicate: (alias: string, org: string, member: string, wide: string) => string }> = {
+        "dormitories": { alias: "d", predicate: boardingDormitoryScopePredicate },
+        "boarding-rooms": { alias: "r", predicate: boardingRoomScopePredicate },
+        "boarding-beds": { alias: "b", predicate: boardingBedScopePredicate },
+        "boarding-assignments": { alias: "ba", predicate: boardingAssignmentScopePredicate },
+        "leave-requests": { alias: "lr", predicate: boardingStudentRecordScopePredicate },
+        "incidents": { alias: "i", predicate: boardingStudentRecordScopePredicate },
+      };
+      const config = configs[match[1] ?? ""];
+      if (!config) throw new Error("boarding_scope_configuration_missing");
+      const orgPlaceholder = `$${values.length-1}`;
+      const membershipPlaceholder = `$${values.length+1}`;
+      const tenantWidePlaceholder = `$${values.length+2}`;
+      values.push(tenant.membershipId, tenantWide);
+      updateSql = `UPDATE ${resource.table} AS ${config.alias} SET ${sets.join(",")}
+        WHERE ${config.alias}.organization_id=${orgPlaceholder}::uuid
+          AND ${config.alias}.id=$${values.length-2}::uuid
+          AND ${config.predicate(config.alias, orgPlaceholder, membershipPlaceholder, tenantWidePlaceholder)}
+        RETURNING ${moduleRecordProjection(resource, tenant.permissions)}`;
+    } else {
+      updateSql = `UPDATE ${resource.table} SET ${sets.join(",")} WHERE organization_id=${values.length-1}::uuid AND id=${values.length}::uuid RETURNING ${moduleRecordProjection(resource, tenant.permissions)}`;
+    }
+    await pool.query("SAVEPOINT module_record_write");
+    try {
+      const result=await pool.query(updateSql,values);
+      if (!result.rows.length) { reply(res,404,{error:"record_not_found"}); return true; }
+      const record=result.rows[0] as Record<string,unknown>;
+      if (match[1] === "boarding-assignments" && Object.prototype.hasOwnProperty.call(body, "assignedUntil")) {
+        const bedId = String(record.bed_id ?? "");
+        await pool.query(
+          `UPDATE boarding.beds b SET bed_status=CASE
+             WHEN EXISTS (SELECT 1 FROM boarding.bed_assignments ba WHERE ba.organization_id=$1::uuid AND ba.bed_id=b.id
+               AND ba.assigned_from<=CURRENT_DATE AND (ba.assigned_until IS NULL OR ba.assigned_until>=CURRENT_DATE)) THEN 'occupied'
+             WHEN EXISTS (SELECT 1 FROM boarding.bed_assignments ba WHERE ba.organization_id=$1::uuid AND ba.bed_id=b.id
+               AND ba.assigned_from>CURRENT_DATE) THEN 'reserved'
+             ELSE 'available' END
+           WHERE b.organization_id=$1::uuid AND b.id=$2::uuid`,
+          [organizationId, bedId],
+        );
+      }
+      await pool.query(`INSERT INTO audit.audit_events (organization_id, actor_user_id, action, resource_type, resource_id, metadata) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6::jsonb)`,[organizationId,userId,"module.record.update",resource.table,String(record.id ?? ""),JSON.stringify({resource:match[1],fields:entries.map(([key])=>key)})]);
+      await pool.query("RELEASE SAVEPOINT module_record_write");
+      reply(res,200,{data:filterModuleRecordForPermissions(match[1] ?? "",record,tenant.permissions)});
+    } catch(reason) {
+      await pool.query("ROLLBACK TO SAVEPOINT module_record_write").catch(() => undefined);
+      await pool.query("RELEASE SAVEPOINT module_record_write").catch(() => undefined);
+      const code=typeof reason==="object"&&reason!==null&&"code" in reason?String((reason as {code:unknown}).code):"";
+      reply(res,code==="23505"?409:code==="23503"?422:code==="23514"?422:500,{error:code==="23505"?"duplicate_record":code==="23503"?"related_record_not_found_in_tenant":code==="23514"?"record_constraint_rejected":"module_record_update_failed"});
+    }
+    return true;
+  }
+  if (match[1] === "library-loans") {
+    await createLibraryLoan(res,pool,userId,organizationId,body);
+    return true;
+  }
+  const error=validateModuleRecordInput(match[1] ?? "",body);
+  if (error) { reply(res,422,{error}); return true; }
+  const entries=Object.entries(resource.fields).filter(([key])=>Object.prototype.hasOwnProperty.call(body,key));
+  if (match[1] === "attendance-sessions") {
+    const classGroupId = typeof body.classGroupId === "string" ? body.classGroupId : "";
+    const allowedClass = await pool.query(
+      `SELECT 1 FROM academic.class_groups cg
+       WHERE cg.organization_id=$1::uuid AND cg.id=$2::uuid
+         AND ${attendanceClassScopePredicate("cg", "$1", "$3", "$4")} LIMIT 1`,
+      [organizationId, classGroupId, tenant.membershipId, tenantWide],
+    );
+    if (!allowedClass.rows.length) { reply(res,403,{error:"attendance_class_scope_required"}); return true; }
+  }
+  if (match[1] === "attendance-records") {
+    const attendanceSessionId = typeof body.attendanceSessionId === "string" ? body.attendanceSessionId : "";
+    const studentId = typeof body.studentId === "string" ? body.studentId : "";
+    const allowedPair = await pool.query(
+      `SELECT 1
+       FROM academic.attendance_sessions ats
+       JOIN academic.class_groups cg
+         ON cg.organization_id=ats.organization_id AND cg.id=ats.class_group_id
+       JOIN academic.enrollments e
+         ON e.organization_id=ats.organization_id
+        AND e.class_group_id=ats.class_group_id AND e.student_id=$3::uuid
+       WHERE ats.organization_id=$1::uuid AND ats.id=$2::uuid
+         AND e.status='enrolled' AND e.enrolled_on<=ats.session_date
+         AND (e.ended_on IS NULL OR e.ended_on>=ats.session_date)
+         AND ${attendanceClassScopePredicate("cg", "$1", "$4", "$5")}
+       LIMIT 1`,
+      [organizationId, attendanceSessionId, studentId, tenant.membershipId, tenantWide],
+    );
+    if (!allowedPair.rows.length) { reply(res,403,{error:"attendance_student_or_class_scope_required"}); return true; }
+  }
+  if (match[1] === "dormitories") {
+    const campusId = typeof body.campusId === "string" ? body.campusId : "";
+    if (!tenantWide && !campusId) { reply(res,403,{error:"dormitory_campus_scope_required"}); return true; }
+    if (campusId) {
+      const allowedCampus = await pool.query(
+        `SELECT 1 FROM core.campuses c WHERE c.organization_id=$1::uuid AND c.id=$2::uuid
+         AND ($4::boolean OR EXISTS (SELECT 1 FROM core.membership_campus_scopes mcs
+           WHERE mcs.organization_id=$1::uuid AND mcs.membership_id=$3::uuid AND mcs.campus_id=c.id
+             AND mcs.revoked_at IS NULL AND mcs.valid_from<=now() AND (mcs.valid_until IS NULL OR mcs.valid_until>now()))) LIMIT 1`,
+        [organizationId, campusId, tenant.membershipId, tenantWide],
+      );
+      if (!allowedCampus.rows.length) { reply(res,403,{error:"dormitory_campus_scope_required"}); return true; }
+    }
+  }
+  if (match[1] === "boarding-rooms") {
+    const dormitoryId = typeof body.dormitoryId === "string" ? body.dormitoryId : "";
+    const allowedDormitory = await pool.query(
+      `SELECT 1 FROM boarding.dormitories d WHERE d.organization_id=$1::uuid AND d.id=$2::uuid
+       AND ${boardingDormitoryScopePredicate("d", "$1", "$3", "$4")} LIMIT 1`,
+      [organizationId, dormitoryId, tenant.membershipId, tenantWide],
+    );
+    if (!allowedDormitory.rows.length) { reply(res,403,{error:"boarding_dormitory_scope_required"}); return true; }
+  }
+  if (match[1] === "boarding-beds") {
+    const roomId = typeof body.roomId === "string" ? body.roomId : "";
+    const allowedRoom = await pool.query(
+      `SELECT 1 FROM boarding.rooms r WHERE r.organization_id=$1::uuid AND r.id=$2::uuid
+       AND ${boardingRoomScopePredicate("r", "$1", "$3", "$4")} LIMIT 1`,
+      [organizationId, roomId, tenant.membershipId, tenantWide],
+    );
+    if (!allowedRoom.rows.length) { reply(res,403,{error:"boarding_room_scope_required"}); return true; }
+  }
+  if (match[1] === "boarding-assignments") {
+    const bedId = typeof body.bedId === "string" ? body.bedId : "";
+    const studentId = typeof body.studentId === "string" ? body.studentId : "";
+    const assignedFrom = typeof body.assignedFrom === "string" ? body.assignedFrom : "";
+    const assignedUntil = typeof body.assignedUntil === "string" ? body.assignedUntil : null;
+    // Serialize placement attempts by student before checking overlapping assignments.
+    const lockedStudent = await pool.query(
+      `SELECT id FROM academic.student_profiles
+       WHERE organization_id=$1::uuid AND id=$2::uuid AND status='active' FOR UPDATE`,
+      [organizationId, studentId],
+    );
+    if (!lockedStudent.rows.length) { reply(res,403,{error:"boarding_student_scope_required"}); return true; }
+    const allowedAssignment = await pool.query(
+      `SELECT 1
+       FROM boarding.beds b
+       JOIN boarding.rooms r ON r.organization_id=b.organization_id AND r.id=b.room_id
+       JOIN boarding.dormitories d ON d.organization_id=r.organization_id AND d.id=r.dormitory_id
+       JOIN academic.student_profiles sp ON sp.organization_id=b.organization_id AND sp.id=$3::uuid
+       WHERE b.organization_id=$1::uuid AND b.id=$2::uuid AND b.bed_status='available'
+         AND sp.status='active' AND d.campus_id IS NOT NULL AND sp.campus_id=d.campus_id
+         AND ${boardingBedScopePredicate("b", "$1", "$4", "$5")}
+         AND NOT EXISTS (
+           SELECT 1 FROM boarding.bed_assignments existing
+           WHERE existing.organization_id=$1::uuid
+             AND (existing.bed_id=b.id OR existing.student_id=sp.id)
+             AND daterange(existing.assigned_from, COALESCE(existing.assigned_until,'infinity'::date), '[]')
+                 && daterange($6::date, COALESCE($7::date,'infinity'::date), '[]')
+         )
+         AND $6::date<=COALESCE($7::date,'infinity'::date)
+         AND ($7::date IS NULL OR $7::date>=CURRENT_DATE)
+       LIMIT 1 FOR UPDATE OF b, sp`,
+      [organizationId, bedId, studentId, tenant.membershipId, tenantWide, assignedFrom, assignedUntil],
+    );
+    if (!allowedAssignment.rows.length) { reply(res,403,{error:"boarding_bed_student_or_scope_unavailable"}); return true; }
+  }
+  if (match[1] === "leave-requests" || match[1] === "incidents") {
+    const studentId = typeof body.studentId === "string" ? body.studentId : "";
+    const eventTimestamp = match[1] === "leave-requests" ? body.requestedFrom : body.occurredAt;
+    const eventDate = typeof eventTimestamp === "string" ? eventTimestamp : "";
+    const allowedStudent = await pool.query(
+      `SELECT 1 FROM academic.student_profiles sp
+       WHERE sp.organization_id=$1::uuid AND sp.id=$2::uuid AND sp.status='active'
+         AND ${boardingStudentScopePredicate("sp", "$1", "$3", "$4", "$5::date")} LIMIT 1`,
+      [organizationId, studentId, tenant.membershipId, tenantWide, eventDate],
+    );
+    if (!allowedStudent.rows.length) { reply(res,403,{error:"boarding_student_scope_required"}); return true; }
+  }
+  const columns=["organization_id",...entries.map(([,field])=>field.column),...(resource.actorColumn?[resource.actorColumn]:[])];
+  const values=[organizationId,...entries.map(([key,field])=>field.kind==="json"?JSON.stringify(body[key]):body[key]),...(resource.actorColumn?[userId]:[])];
+  const placeholders=values.map((_,i)=>{ const kind=i===0 || (Boolean(resource.actorColumn) && i===values.length-1) ? "uuid" : entries[i-1]?.[1].kind; const suffix=kind==="uuid"?"::uuid":kind==="date"?"::date":kind==="timestamp"?"::timestamptz":kind==="json"?"::jsonb":""; return "$"+String(i+1)+suffix; });
+  await pool.query("SAVEPOINT module_record_write");
+  try {
+    let insertSql = `INSERT INTO ${resource.table} (${columns.join(",")}) VALUES (${placeholders.join(",")}) RETURNING ${moduleRecordProjection(resource, tenant.permissions)}`;
+    let insertValues: unknown[] = values;
+    if (!tenantWide && match[1] === "purchase-requests") {
+      insertSql = `INSERT INTO procurement.purchase_requests (${columns.join(",")})
+        SELECT ${placeholders.join(",")}
+        WHERE $2::uuid IS NOT NULL AND EXISTS (
+          SELECT 1 FROM core.membership_campus_scopes mcs
+          WHERE mcs.organization_id=$1::uuid AND mcs.membership_id=$8::uuid
+            AND mcs.campus_id=$2::uuid AND mcs.revoked_at IS NULL
+            AND mcs.valid_from<=now() AND (mcs.valid_until IS NULL OR mcs.valid_until>now())
+        )
+        RETURNING ${moduleRecordProjection(resource, tenant.permissions)}`;
+      insertValues = [...values, tenant.membershipId];
+    } else if (!tenantWide && match[1] === "purchase-request-lines") {
+      insertSql = `INSERT INTO procurement.purchase_request_lines (${columns.join(",")})
+        SELECT ${placeholders.join(",")}
+        FROM procurement.purchase_requests pr
+        WHERE pr.organization_id=$1::uuid AND pr.id=$2::uuid
+          AND pr.request_status='draft'
+          AND ${campusScopePredicate("pr", "$1", "$6", "false")}
+        RETURNING ${moduleRecordProjection(resource, tenant.permissions)}`;
+      insertValues = [...values, tenant.membershipId];
+    }
+    const result=await pool.query(insertSql,insertValues);
+    const record = result.rows[0] as Record<string, unknown> | undefined;
+    if (!record) {
+      await pool.query("ROLLBACK TO SAVEPOINT module_record_write");
+      await pool.query("RELEASE SAVEPOINT module_record_write");
+      reply(res,403,{error:"campus_scope_required_or_request_not_draft"}); return true;
+    }
+    if (match[1] === "boarding-assignments") {
+      const bedStatusUpdate = await pool.query(
+        `UPDATE boarding.beds SET bed_status=CASE WHEN $3::date>CURRENT_DATE THEN 'reserved' ELSE 'occupied' END
+         WHERE organization_id=$1::uuid AND id=$2::uuid AND bed_status='available' RETURNING id`,
+        [organizationId, String(body.bedId), String(body.assignedFrom)],
+      );
+      if (!bedStatusUpdate.rows.length) {
+        const conflict = new Error("boarding_bed_status_changed") as Error & { code: string };
+        conflict.code = "23505";
+        throw conflict;
+      }
+    }
+    await pool.query(`INSERT INTO audit.audit_events (organization_id, actor_user_id, action, resource_type, resource_id, metadata) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6::jsonb)`, [organizationId,userId,"module.record.create",resource.table,String(record.id ?? ""),JSON.stringify({ resource: match[1] })]);
+    await pool.query("RELEASE SAVEPOINT module_record_write");
+    reply(res,201,{data:filterModuleRecordForPermissions(match[1] ?? "",record,tenant.permissions)});
+  } catch (reason) {
+    await pool.query("ROLLBACK TO SAVEPOINT module_record_write").catch(() => undefined);
+    await pool.query("RELEASE SAVEPOINT module_record_write").catch(() => undefined);
+    const code=typeof reason==="object"&&reason!==null&&"code" in reason?String((reason as {code:unknown}).code):"";
+    reply(res,code==="23505"?409:code==="23503"?422:code==="23514"?422:500,{error:code==="23505"?"duplicate_record":code==="23503"?"related_record_not_found_in_tenant":code==="23514"?"record_constraint_rejected":"module_record_create_failed"});
+  }
+  return true;
+}

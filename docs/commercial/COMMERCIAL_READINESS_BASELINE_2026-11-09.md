@@ -1,0 +1,220 @@
+# PONDOK OS + Central Command — Commercial Readiness Baseline
+
+**Assessment date:** 9 November 2026  
+**Repository baseline:** `10402d1094bde8bef753ece464dcd7b5a79fb5a7`  
+**Repository:** `n30AK/PONDOK-OS`  
+**Target environments:** Neon Development `br-proud-paper-b312lfxi`; Staging `br-red-unit-b30ndbvw`  
+**Production boundary:** Neon Production `br-late-cherry-b3uqtuvh` is excluded from this work.
+
+## 1. Release decision
+
+**NO-GO for general commercial release. NO-GO for production institutional operations.**
+
+The repository has meaningful architecture, security controls, data foundations, UI workspaces, and automated build/test coverage. Those facts do not establish that the product can safely run a real pesantren's daily operations or that AKVISIO can fulfil commercial, support, legal, and recovery obligations.
+
+A controlled pilot may be prepared only after the pilot-entry gates in section 7 pass. Pilot status must not be represented as general availability.
+
+## 2. Verified baseline
+
+### Platform and data foundations
+
+- Development implementation-status snapshot records 67 organization-owned tables with RLS ENABLE and FORCE.
+- A direct read-only Development query on 9 November 2026 reconfirmed 67/67 organization-owned tables with RLS ENABLE and FORCE, 28 migration ledger entries, and zero rows in organizations, organization memberships, student profiles, HR employees, platform customers, module entitlements and module orders.
+- The same live inspection confirmed `core.organization_memberships` itself has RLS ENABLE + FORCE with platform-controlled insert and self/active-tenant or Super Admin read policies.
+- A direct read-only transaction assuming the actual runtime roles confirmed `pondok_runtime` is NOLOGIN/NOBYPASSRLS with 63/63 tenant-owned tables covered by FORCE RLS and the `tenant_isolation` policy; `pondok_platform_runtime` is NOLOGIN/NOBYPASSRLS with 79/79 platform tables (excluding the separately owner-checked `platform.super_admins` authority table) covered by FORCE RLS and policies. This does not replace the pending two-tenant API isolation test.
+- The implementation-status audit records 45 distinct read/write permission keys referenced by 44 module resources.
+- The workspace/API contract records 44 module resources: 42 generic tenant-scoped resources plus dedicated encrypted student identity-document and health-profile handlers.
+- Development snapshot records zero organizations, memberships, student profiles, and HR employees; no fabricated tenant or personal records have been seeded.
+- PR #155 adds an actual HTTP API integration test using two independently signed synthetic EdDSA JWT identities against disposable PostgreSQL. CI #1343 passed: each identity reads only its own tenant records; changing the organization header and cross-tenant reads/writes are denied. Live Neon Auth acceptance with two real users and two real institution tenants remains pending.
+- `STUDENT_IDENTITY_ENCRYPTION_KEY` remains absent from the Development Function environment. PR #154 now strictly validates canonical Base64 32-byte AES-256 keys and key-version labels for both health and identity data, with fail-closed tests. Identity-document operations must remain fail-closed until the key is provisioned through the approved secret vault, recoverable encrypted backup is verified, and rotation/recovery is prepared.
+- CI #1286 and Neon Function bundle #225 passed for PR #144. PR #144 was merged as `10402d1094bde8bef753ece464dcd7b5a79fb5a7`. This verifies the tested build/unit-test pipeline for that change; it does not prove live tenant acceptance or post-merge production readiness.
+
+### PONDOK OS module status
+
+| Domain | Verified foundation | Commercial blocker / acceptance still required |
+|---|---|---|
+| Tenant and institution setup | Organization, campus, membership, role, permission and activation foundations | Real institution onboarding, legal identity/authority checks, owner handover, and two-tenant isolation UAT |
+| Student and guardian master | Student profile, structured address, guardian relations, health and identity API foundations | Identity key/backup/rotation; consent and authority evidence; secure document vault; lifecycle and role-based UAT |
+| PPDB | Admission period/application foundations; accepted-applicant conversion now creates a student profile plus primary guardian contact and normalized student–guardian relation | Full checklist, secure document handling, selection/interview, guardian portal, daftar ulang/payment, transition from applicant to active student, and multi-guardian handling |
+| Academic | Student/class/educator foundations | Curriculum versions, schedules, attendance correction, assessment, report cards, promotion/graduation and complete lifecycle |
+| Boarding / kesantrian | Dormitory, room, bed, assignment, leave and incident resources | Approval, safeguarding, check-in/out, escalation, guardian communication and protected case handling |
+| Finance/accounting | Chart of accounts, fiscal periods, journal draft/list, balanced-posting guard, period close and immutable posted journals | Full approval/posting UI, statements, budgets, cash/bank reconciliation, billing lifecycle and accountant UAT |
+| Inventory/procurement | Item/warehouse/stock movement foundations | Requisition, approval, PO, partial receipt, issue/transfer, stock opname, valuation, returns and reconciliation |
+| HR/payroll | Employee, payroll period/run, approval/payment foundations | Attendance, shifts, leave, versioned payroll formulas, PPh 21/BPJS/THR validation, payslips, payment and statutory review |
+| Library | Catalog/copy/loan and issue/return foundations | Renewal, reservation, overdue, loss/damage, policy, fines where authorized, and reporting |
+| CMS/announcements | Initial page and announcement workspaces | Editorial review, revision history, publishing/unpublishing, audience targeting and public rendering |
+| CRM/alumni/donors | Contact, interaction and pledge foundations | Consent/withdrawal ledger, communication suppression, donation receipt, payment reconciliation and retention |
+| Reports/dashboard | Report catalog and report-workspace foundations | Data-backed KPIs, scoped queries, filters, reconciled totals, PDF/XLSX/CSV controls, provenance and export audit |
+| Offline/mobile/kiosk | PWA shell, device registry, event inbox, idempotency/checkpoint foundations | Local outbox, domain processor, conflict review, offline recovery, Android/iOS, installer signing and kiosk acceptance |
+
+### Central Command status
+
+Central Command must be assessed as AKVISIO's company operating system and platform control plane, not only as a Super Admin dashboard.
+
+The existing 23-menu audit identifies these material gaps:
+
+- PR #150 adds Super Admin-only aggregate counts for customers, active subscriptions, unpaid invoices, online/degraded/offline installations, open support cases, and backup/verification/restore failures in the last 30 days. This is a data-backed operational snapshot, not a complete KPI model: MRR/revenue by currency, churn/cohort, lead conversion, renewal forecasts, SLA aging, customer health, and reconciled finance dashboards remain incomplete.
+- CRM has lead/customer/contact foundations but lacks full pipeline, activities, conversion and customer-success lifecycle.
+- Product catalogue lacks complete package composition, module compatibility, price/version snapshots and publication governance.
+- Quotes and contracts have approval foundations, but subscription lifecycle, renewals, amendments, proration, grace periods, suspension/cancellation and entitlement synchronization remain incomplete.
+- Billing has invoice/payment and double-entry posting foundations, but tax configuration, credit/debit notes, refunds, recurring billing, dunning, aging, receipts and bank reconciliation remain incomplete.
+- Accounting lacks complete manual journal controls, reversal, trial balance, GL drill-down, financial statements and bank reconciliation.
+- Customer registry lacks full legal entity, authorized signatory, multiple branch/site, billing profile and customer 360 lifecycle.
+- PR #146 corrected the prior menu mismatch: the request approval queue is now labelled **Permintaan Modul**, and a separate **Entitlement Registry** provides a Super Admin-only, read-only view of entitlements, orders and redacted lifecycle events. It intentionally exposes no grant/suspend/resume/revoke actions. The full order, approval, billing and provisioning lifecycle remains incomplete.
+- Procurement, inventory, HRD, support, fleet, backup, warranty, documents and internal operations have data foundations and some initial-record forms. Initial record creation is not the same as approval, fulfilment, posting, resolution, restore, or other lifecycle completion.
+- Reports and compliance are not complete report-generation or compliance-management systems.
+- Agent runtime/dispatch must remain disabled until tool allowlists, scoped permissions, sandboxing, budget controls, approval UX, audit, evaluation, stop/kill switch and rollback are proven.
+
+## 3. Mandatory safety and legal controls
+
+1. Tenant scope must be enforced at API and database layers; never rely on UI hiding.
+2. Test with at least two distinct tenant identities and prove cross-tenant reads, writes, relation pickers, exports and background jobs are denied.
+3. Student data, child data, health data, identity documents, employee identifiers, tax data and bank data require purpose limitation, least privilege, masking, encryption, audit and retention controls.
+4. Guardian contact, biological relationship, legal guardianship and pickup authority are separate facts. Pickup authority requires verified basis, validity dates and revocation history.
+5. Sensitive exports require explicit permission, masking, reason where appropriate, audit, volume limits and safe file handling.
+6. Posted accounting records are immutable; corrections use reversal/adjustment workflows.
+7. Payroll formulas and tax/social-security rules must be versioned and reviewed for the applicable effective period. Do not claim tax or BPJS compliance solely from a successful calculation test.
+8. Regulatory mappings must be reviewed against current official sources and applicability for the institution's legal form, education pathway, licence and location. Do not claim EMIS, SIMTREN, Dapodik, tax, or BPJS integration without official specifications, authorization and acceptance.
+9. AI agents may inspect and propose. They must not autonomously approve payroll, payments, accounting postings, access grants, production deployments, data exports, remote commands, or destructive changes.
+10. Production database, secrets, live customer records and tenant activation remain outside autonomous development changes.
+
+## 4. Commercial operations required in Central Command
+
+Before AKVISIO sells a subscription, the control plane needs tested workflows for:
+
+- Customer prospect, qualification, activity history, consent and lead conversion.
+- Legal entity and authorized signatory verification, customer contacts and branches/sites.
+- Product, package, module/version compatibility, price books, limits and immutable offer snapshots.
+- Quote, contract, signature evidence, DPA, SLA, renewal, amendment and termination.
+- Subscription state, billing schedule, proration, grace period, dunning, suspension and resumption.
+- Module entitlement grants/revocations bound to customer, tenant, installation, module/version and contract/subscription.
+- Invoice numbering, tax profile, receipts, payment verification, refunds/credit notes, receivables and reconciliation.
+- Customer onboarding checklist, data import, training, acceptance and go-live approval.
+- Support cases, incident/SLA lifecycle, maintenance, warranty, repair and customer communication.
+- Installation enrollment, device identity, telemetry consent, health monitoring, signed releases, rollback and support access consent.
+- Backup policy, immutable/offsite retention, restore drills and documented RPO/RTO evidence.
+- Security incident, vulnerability, privacy request, data export/return/deletion, breach response and audit evidence.
+
+## 5. Prioritized work order
+
+### P0 — Must pass before any pilot with real student data
+
+- Close PR and post-merge pipeline verification; reconcile implementation documentation with current code.
+- Provision identity encryption through approved secret management, test key length, backup, restore, rotation and fail-closed behavior.
+- Complete two-tenant/two-user API and RLS isolation acceptance.
+- Complete institution onboarding/activation with a verified authorized operator and real pilot institution.
+- Complete student ↔ guardian ↔ legal authority ↔ PPDB conversion flows.
+- Complete core academic and boarding daily workflows, including protected incident handling.
+- Complete access review, audit evidence, backup/restore and incident response runbooks.
+- Complete privacy notice, consent, retention and data-subject request procedures for pilot scope.
+
+### P1 — Must pass before paid Limited Commercial Release
+
+- Complete finance, receivables, payment and accounting lifecycle for the marketed package.
+- Complete HR/payroll lifecycle for the marketed package, with effective-dated legal calculation review.
+- Complete inventory/procurement and library workflows if those modules are included in the offer.
+- Replace placeholder dashboard metrics with reconciled, role-scoped data.
+- Complete Central Command customer, contract, subscription, entitlement and billing lifecycle.
+- Complete support, SLA, maintenance, backup and restore operations.
+- Publish explicit service scope, SLA, support hours, data processing terms, onboarding and exit/export terms.
+- Execute pilot UAT, defect triage, sign-off and rollback rehearsal.
+
+### P2 — Required before General Availability or the relevant edition is advertised
+
+- Android/iOS release and signing.
+- Offline installer, local identity/database setup, sync conflict resolution and recovery acceptance.
+- Kiosk/wall display and guardian portal acceptance.
+- Government/external integrations only after official technical and authorization acceptance.
+- Agent runtime only after safety, permission, sandbox, budget, approval, audit and rollback acceptance.
+- Capacity, performance, availability, disaster recovery and security assessment appropriate to the service commitments.
+
+## 6. Definition of done for every marketed module
+
+A module cannot be marked operational or included in a commercial package until evidence exists for all applicable items:
+
+1. Approved domain specification, roles, data classification and regulatory applicability.
+2. Database migration and constraints applied to the intended non-production environment.
+3. Authenticated API with server-side authorization for reads, writes and state transitions.
+4. Tenant and campus scope plus cross-tenant denial tests.
+5. UI forms and workflow states with loading, error, empty, validation and permission handling.
+6. Domain lifecycle, approvals, maker-checker controls and idempotency where applicable.
+7. Audit events for sensitive reads, exports, state changes and approvals.
+8. Unit, integration, authorization, regression and end-to-end tests.
+9. Backup/restore, retention, monitoring and runbook coverage appropriate to risk.
+10. UAT evidence from the pilot institution, including role-based sign-off and reconciled outputs.
+11. Accurate release notes and a documented list of excluded/limited capabilities.
+
+## 7. Pilot-entry and release gates
+
+| Gate | Required evidence | Current status |
+|---|---|---|
+| G0 — Engineering baseline | Main build, CI, API bundle, Pages/release artifacts and no unresolved critical defects | Partial; PR #161 CI #1413, PR #165 CI #1457, PR #167 CI #1478, PR #170 CI #1481 and Neon Function bundles #288/#291 passed; Development Function deployment #61 completed. Direct HTTP readiness/legacy-route response and Pages publication remain unverified from the available inspection path |
+| G1 — Security baseline | Two-tenant isolation, identity-key lifecycle, audit, backup/restore and access review | Blocked |
+| G2 — Institution onboarding | Verified institution, authorized Super Admin approval, tenant activation, owner handover | Blocked; Development has no institution tenant in the last audit |
+| G3 — Core operational UAT | Student/guardian/PPDB, academic, boarding, finance and HR flows for pilot scope | Blocked |
+| G4 — Commercial operations | Contract, subscription, entitlement, invoice/payment, support/SLA and offboarding | Blocked |
+| G5 — Pilot acceptance | Real users, role-based test scripts, defect closure, reconciled reports, signed acceptance | Blocked |
+| G6 — Limited Commercial Release | Published scope, pricing/terms, support, security and operational sign-off | Blocked |
+| G7 — General Availability | Capacity, DR, mobile/offline as advertised, integrations and sustained operations | Blocked |
+
+## 8. Release communication rule
+
+Until G0–G5 are evidenced, describe the product as **Development / controlled pilot preparation**, not commercial-ready. A successful build, green health endpoint, menu, database table, generic CRUD form, or demo dataset is not proof of commercial readiness.
+
+Do not mark the entire platform ready when only selected modules have passed. Commercial packages must identify exactly which modules and deployment modes are accepted, and which are still roadmap or pilot-only.
+
+
+## Update after PR #146 (2026-11-09)
+
+- PR #146 merged as `c5694cd24f36a34cf89e210bbeb2b7e7f1f55e15`. CI #1299 completed successfully across migration checks, RLS, workspace typecheck/build, Pages checks, Neon Function bundle, container build/smoke tests and unit tests; Neon Function bundle #227 also passed.
+- Central Command now has separate **Permintaan Modul** and read-only **Entitlement Registry** pages. The registry returns entitlement, order and redacted lifecycle-event datasets after active Super Admin authorization. It does not mutate entitlement state.
+- The registry SQL was checked read-only against the live Development schema. The Development tables currently contain zero customers, module entitlements and module orders, so no live customer workflow was exercised.
+- No schema, migration, seed, secret, Neon Development write or Neon Production change was made by PR #146. Post-merge deployment workflows have not been independently confirmed in this checkpoint.
+
+
+## Update after PR #147 (2026-11-09)
+
+- PR #147 merged as `5714030418083c43e3800ecfb88c065c6dfaf265`. CI #1301 and Neon Function bundle #229 passed.
+- Added unit tests for the actual `withTenantScope` and `loadTenantContext` helpers: authenticated user/organization context is bound inside a transaction, a user cannot load another organization's membership by changing the selected organization, and transaction-local role/context is cleared before pooled connection reuse.
+- These are automated helper tests using synthetic identities and a query double. The existing disposable-PostgreSQL RLS test separately checks two synthetic tenants at database level. Live API acceptance with two real authenticated users and two actual non-production organizations remains pending; G1 is still blocked.
+
+
+## Update after PR #149 and PR #150 (2026-11-09)
+
+- PR #149 merged as `db446339cceb88ae0100fb0f6954b046c0e3615e`. CI #1312 and Neon Function bundle #231 passed. PPDB now captures the applicant-declared guardian relationship and, on accepted-applicant conversion, atomically creates the student profile, a primary guardian contact, and the student–guardian link. Guardian communication consent starts as pending. Legal-guardian, emergency-contact and pickup flags remain false until evidence-based verification. This is not yet a complete PPDB registration/payment-to-active-student workflow.
+- PR #150 merged as `2b5d0d9e4ae7d145db8861fba028f5df85dd6cc1`. CI #1320 and Neon Function bundle #234 passed. Central Command overview now reads aggregate commercial/operational metrics from platform tables through a Super Admin-only, read-only API. The Development snapshot currently returns zeros because no customer, subscription, invoice, installation, support or backup records are present.
+- Both changes are code/test/UI changes only. No Neon Development or Production writes, schema changes, migrations, or seed records were performed. Post-merge Pages/Release Bundle deployment evidence remains to be independently checked.
+
+
+## Update after PR #152 (2026-11-09)
+
+- PR #152 merged as `8357efe3e9a550df04d355b73c2c51a8d7e258db`; PONDOK OS CI #1327 passed and Neon Function bundle #236 passed.
+- `GET /health/ready` now checks database connectivity, transaction-local assumption of `pondok_runtime` and `pondok_platform_runtime`, NOLOGIN/NOBYPASSRLS attributes, tenant table FORCE RLS + `tenant_isolation` policy coverage, membership RLS, and platform-table FORCE RLS + policy coverage. It fails closed with HTTP 503 when these checks fail.
+- The exact checks were executed read-only against Neon Development under both runtime roles: tenant 63/63 and platform 79/79, with both roles NOLOGIN/NOBYPASSRLS. No database writes or migrations were performed.
+- Neon Development Function `pondokapi` deployment #52 is reported completed. Direct HTTP health verification could not be completed from the available inspection path, so do not claim the endpoint response was independently confirmed.
+- Current Function environment metadata still lists `STUDENT_HEALTH_ENCRYPTION_KEY` but not `STUDENT_IDENTITY_ENCRYPTION_KEY`. Identity-document writes must remain fail-closed. The key must not be generated/configured without an approved secure secret and recoverable-backup/rotation process.
+- No Neon Production changes or data seeding occurred. Two-real-tenant API acceptance, institution UAT and commercial lifecycle remain release blockers.
+
+
+## Update after PR #154 and PR #155 (2026-11-09)
+
+- PR #154 merged as `719965913b65b2552b11e30bf2c8f79ae9d14251`; CI #1341 and Neon Function bundle #241 passed. Both health and identity AES-256-GCM key configuration now requires canonical standard Base64 for exactly 32 bytes and a valid version label. Missing or malformed identity key remains fail-closed. Added a secure Development-only provisioning/recovery runbook. No key was generated or configured.
+- PR #155 merged as `15988acabbae34c7f63ff5b6a9ef1eeba94bca5e`; CI #1343 and Neon Function bundle #242 passed. The new CI integration test runs the actual API HTTP server against disposable PostgreSQL with two separately signed synthetic JWT identities, proves own-tenant reads, and denies changed-header, cross-tenant reads and writes.
+- Development Neon Function `pondokapi` deployment #53 is completed. Environment metadata still does not include `STUDENT_IDENTITY_ENCRYPTION_KEY`. No direct HTTP health response could be retrieved from the available network path.
+- The new test is stronger automated API evidence but does not substitute for two real Neon Auth users, two institution tenants, live onboarding, backup/restore drill or institution UAT. G1, G2, G3 and commercial gates remain blocked.
+- No Development database writes, schema migrations, tenant seeds, identity keys, or Production changes were performed by these PRs.
+
+
+## Update after PR #157–#160 and direct Development catalog inspection (2026-11-09)
+
+- PR #157 grouped institution/personnel master data navigation. PR #158 masks sensitive student-health fields in table/list/detail views. PR #159 filters guardian legal-authority and pickup-authority response fields from generic list/create/update responses unless the caller has the dedicated `academic.students.guardians.verify` permission. The user reported post-merge CI #1369, Release Bundle #116 and Neon Function bundle #248 successful for merge commit `4939e9ede4f1313abd4117d0814767c46350ccc6`.
+- PR #160 replaces broad hard-coded master-data grouping with `Resource.group` as the single source of truth and aligns sidebar active states. Main source was re-read: Master Data Santri has student/guardian pages only; educator/organization and SDM/payroll pages are separate.
+- Fresh read-only Development inspection reconfirmed 67 tables with `organization_id`, 145 application tables with RLS enabled and forced, and the migration ledger through 0028. Previously verified restricted runtime coverage remains 63/63 tenant tables and 79/79 platform tables. These catalog checks do not substitute for live two-tenant HTTP acceptance.
+- Fresh read-only counts remain zero for organizations, memberships, student profiles, HR employees, platform customers, subscriptions, entitlements and module orders. No tenant or synthetic personal data was created. The same read-only query found zero backup policies and backup runs; the Control Center only records disabled backup-policy drafts, with no backup executor, immutable offsite storage or completed restore test.
+- Development `pondokapi` Function deployment #61 is completed. Its environment metadata still lacks `STUDENT_IDENTITY_ENCRYPTION_KEY`; identity-document operations remain fail-closed. The metadata also still lists the retired `PONDOK_BOOTSTRAP_TOKEN_SHA256` variable. Direct HTTP readiness and legacy-route responses have not yet been independently verified.
+- PR #40 has been closed as superseded, not merged. The older `PONDOK_DATABASE_URL` / `pondok_app` proposal conflicts with current transaction-scoped `pondok_runtime` / `pondok_platform_runtime` architecture and must not be merged.
+- PR #161 is merged. It removes the unreachable token-based setup UI, the direct database `db:bootstrap` command, the unused first-organization bootstrap handler/test, the token generator and digest injection from deployment configuration. It adds regression tests for the approved activation path and a live deployment assertion expecting HTTP 410 from the retired public endpoint. Development Function deployment #59 is completed; direct HTTP verification from the current inspection environment failed DNS resolution, so the assertion's workflow result still needs independent inspection. The retired bootstrap digest name still appears in Function environment metadata, although current code no longer consumes it.
+- PR #162 adds a source-backed Indonesian child-data and education regulatory readiness matrix; PR #164 flags the PP TUNAS transitional reporting deadline and PSE-private registration review as urgent legal gates.
+- PR #165 is merged. Migration 0027 is applied on Development and links `platform.customers.tenant_id` to `core.organizations`, with a partial unique index enforcing one commercial customer per tenant. The CRM UI and Super Admin API support creating a linked customer or linking an existing prospect; the link is one-way and audited. The Development customer registry remains empty, and no contracts, subscriptions, invoices, installations or module entitlements were created by this change.
+- PR #170 adds `apps/api/scripts/test-live-tenant-auth-isolation.mjs` and a runbook for real Neon Auth two-user/two-tenant Development acceptance. It is pinned to the approved Development Function hostname, checks own-tenant context/program reads and cross-tenant context/read/write denial, and performs no record writes. CI #1481 and Neon Function bundle #291 passed. It is a harness only: it has not been run because Development still has zero organizations and there are no two actual tenant identities to test. G1 remains blocked until real, approved non-production tenants and two distinct Neon Auth users are onboarded and the script passes.
+- PR #167 is merged. Migration 0028 adds a partial unique index so one CRM lead can create at most one customer. The Super Admin API and Central Command UI now support converting a lead only after it is explicitly marked `won`; conversion locks the lead, creates a prospect customer and writes audit events in one transaction. Lead email/phone may seed billing contact fields. The customer remains `prospect`: no contract, subscription, invoice, installation or module entitlement is created. CI #1478 and Neon Function bundle #288 passed; Development Function deployment #61 completed. Migration 0028 is recorded in the Development ledger, and the customer registry remains empty. Direct HTTP readiness and Pages publication remain unverified. Commercial release remains **NO-GO**. The new UI/navigation/security improvements do not complete real institution onboarding, live two-tenant acceptance, identity-key lifecycle, backup/restore, domain workflows, Central Command commercial lifecycle or role-based UAT.

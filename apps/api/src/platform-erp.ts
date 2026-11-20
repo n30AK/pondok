@@ -1,0 +1,391 @@
+import { randomUUID } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { TenantDatabase } from "./tenant-db.js";
+
+type Json = Record<string, unknown>;
+type Client = { query<T = unknown>(sql: string, values?: unknown[]): Promise<{ rows: T[] }>; release(): void };
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LEAD_STAGES = ["new", "qualified", "discovery", "demo", "proposal", "negotiation", "won", "lost", "dormant"] as const;
+const CUSTOMER_TYPES = ["institution", "foundation", "company", "individual", "government", "other"] as const;
+
+function reply(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer" });
+  res.end(JSON.stringify(body));
+}
+function record(value: unknown): value is Json {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+async function readJson(req: IncomingMessage): Promise<Json | null> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += part.length;
+    if (size > 32_768) return null;
+    chunks.push(part);
+  }
+  try {
+    const value: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    return record(value) ? value : null;
+  } catch { return null; }
+}
+function emailValid(value: string): boolean {
+  return value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+export function validateLeadInput(value: Json): string | null {
+  if (typeof value.organizationName !== "string" || value.organizationName.trim().length < 2 || value.organizationName.length > 180) return "invalid_organization_name";
+  if (typeof value.contactName !== "string" || value.contactName.trim().length < 2 || value.contactName.length > 160) return "invalid_contact_name";
+  if (value.email !== undefined && value.email !== null && (typeof value.email !== "string" || !emailValid(value.email.trim()))) return "invalid_email";
+  if (value.phone !== undefined && value.phone !== null && (typeof value.phone !== "string" || value.phone.length > 40)) return "invalid_phone";
+  if (value.source !== undefined && (typeof value.source !== "string" || value.source.trim().length < 2 || value.source.length > 60)) return "invalid_source";
+  if (value.stage !== undefined && !LEAD_STAGES.includes(value.stage as typeof LEAD_STAGES[number])) return "invalid_lead_stage";
+  if (value.estimatedValue !== undefined && value.estimatedValue !== null && (typeof value.estimatedValue !== "number" || !Number.isFinite(value.estimatedValue) || value.estimatedValue < 0 || value.estimatedValue > 1_000_000_000_000_000)) return "invalid_estimated_value";
+  if (value.currency !== undefined && (typeof value.currency !== "string" || !/^[A-Z]{3}$/.test(value.currency))) return "invalid_currency";
+  if (value.consentStatus !== undefined && !["unknown", "granted", "withdrawn", "not_required"].includes(String(value.consentStatus))) return "invalid_consent_status";
+  if (value.notes !== undefined && value.notes !== null && (typeof value.notes !== "string" || value.notes.length > 5000)) return "invalid_notes";
+  if (value.lostReason !== undefined && value.lostReason !== null && (typeof value.lostReason !== "string" || value.lostReason.length > 1000)) return "invalid_lost_reason";
+  return null;
+}
+export function validateCustomerInput(value: Json): string | null {
+  if (typeof value.legalName !== "string" || value.legalName.trim().length < 2 || value.legalName.length > 220) return "invalid_legal_name";
+  if (typeof value.displayName !== "string" || value.displayName.trim().length < 2 || value.displayName.length > 180) return "invalid_display_name";
+  if (value.entityType !== undefined && !CUSTOMER_TYPES.includes(value.entityType as typeof CUSTOMER_TYPES[number])) return "invalid_entity_type";
+  if (value.billingEmail !== undefined && value.billingEmail !== null && (typeof value.billingEmail !== "string" || !emailValid(value.billingEmail.trim()))) return "invalid_billing_email";
+  if (value.billingPhone !== undefined && value.billingPhone !== null && (typeof value.billingPhone !== "string" || value.billingPhone.length > 40)) return "invalid_billing_phone";
+  if (value.billingAddress !== undefined && !record(value.billingAddress)) return "invalid_billing_address";
+  if (value.billingAddress && JSON.stringify(value.billingAddress).length > 8000) return "billing_address_too_large";
+  if (value.organizationId !== undefined && value.organizationId !== null && (typeof value.organizationId !== "string" || !UUID.test(value.organizationId))) return "invalid_organization_id";
+  return null;
+}
+async function withAdmin<T>(pool: TenantDatabase, userId: string, work: (client: Client) => Promise<T>): Promise<{ forbidden: boolean; value?: T }> {
+  if (!pool.connect) throw new Error("platform_transaction_unavailable");
+  const client = await pool.connect() as Client;
+  let active = false;
+  try {
+    await client.query("BEGIN"); active = true;
+    const check = await client.query<{ allowed: boolean }>(
+      "SELECT EXISTS (SELECT 1 FROM platform.super_admins WHERE user_id = $1::uuid AND status = 'active') AS allowed", [userId],
+    );
+    if (check.rows[0]?.allowed !== true) {
+      await client.query("ROLLBACK"); active = false;
+      return { forbidden: true };
+    }
+    await client.query("SELECT set_config('app.user_id', $1, true)", [userId]);
+    await client.query("SET LOCAL ROLE pondok_platform_runtime");
+    const value = await work(client);
+    await client.query("COMMIT"); active = false;
+    return { forbidden: false, value };
+  } catch (error) {
+    if (active) await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally { client.release(); }
+}
+async function audit(client: Client, userId: string, action: string, resource: string, id: string, metadata: Json = {}): Promise<void> {
+  await client.query(
+    "INSERT INTO platform.audit_events (actor_user_id, action, resource_type, resource_id, metadata) VALUES ($1::uuid,$2,$3,$4::uuid,$5::jsonb)",
+    [userId, action, resource, id, JSON.stringify(metadata)],
+  );
+}
+function errorCode(error: unknown): string {
+  return typeof error === "object" && error !== null && "code" in error ? String((error as { code: unknown }).code) : "";
+}
+
+export async function handlePlatformErpRequest(req: IncomingMessage, res: ServerResponse, pool: TenantDatabase, userId: string): Promise<boolean> {
+  const url = new URL(req.url ?? "/", "http://localhost");
+  const path = url.pathname;
+  const leadId = path.match(/^\/v1\/platform\/erp\/leads\/([0-9a-f-]{36})$/i)?.[1];
+  const leadConversionId = path.match(/^\/v1\/platform\/erp\/leads\/([0-9a-f-]{36})\/convert$/i)?.[1];
+  const customerId = path.match(/^\/v1\/platform\/erp\/customers\/([0-9a-f-]{36})$/i)?.[1];
+  const isLead = path === "/v1/platform/erp/leads" || Boolean(leadId) || Boolean(leadConversionId);
+  const isCustomer = path === "/v1/platform/erp/customers" || Boolean(customerId);
+  const isMetrics = path === "/v1/platform/erp/executive-metrics";
+  if (!isLead && !isCustomer && !isMetrics) return false;
+  if ((leadId && !UUID.test(leadId)) || (leadConversionId && !UUID.test(leadConversionId)) || (customerId && !UUID.test(customerId))) { reply(res, 400, { error: "invalid_resource_id" }); return true; }
+
+  if (leadConversionId && req.method !== "POST") { reply(res, 405, { error: "method_not_allowed" }); return true; }
+
+  if (req.method === "GET") {
+    const rawLimit = Number(url.searchParams.get("limit") ?? "50");
+    const limit = Number.isInteger(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 50;
+    const q = (url.searchParams.get("q") ?? "").trim().slice(0, 100);
+    try {
+      const scoped = await withAdmin(pool, userId, async (client) => {
+        if (isMetrics) {
+          const result = await client.query(
+            `SELECT
+               (SELECT count(*)::int FROM platform.customers) AS "totalCustomers",
+               (SELECT count(*)::int FROM platform.customers WHERE status='active') AS "activeCustomers",
+               (SELECT count(*)::int FROM platform.subscriptions
+                 WHERE status IN ('trial','active','grace') AND (ends_at IS NULL OR ends_at >= now())) AS "activeSubscriptions",
+               (SELECT count(*)::int FROM platform.invoices WHERE status IN ('issued','partially_paid','overdue')) AS "outstandingInvoices",
+               (SELECT count(*)::int FROM platform.installations WHERE status='online') AS "onlineInstallations",
+               (SELECT count(*)::int FROM platform.installations WHERE status='degraded') AS "degradedInstallations",
+               (SELECT count(*)::int FROM platform.installations WHERE status='offline') AS "offlineInstallations",
+               (SELECT count(*)::int FROM platform.support_cases WHERE status IN ('open','assigned','in_progress','waiting_customer')) AS "openSupportCases",
+               (SELECT count(*)::int FROM platform.backup_runs
+                 WHERE created_at >= now() - interval '30 days'
+                   AND (status='failed' OR verification_status='failed' OR restore_test_status='failed')) AS "backupFailuresLast30Days",
+               now() AS "asOf"`,
+          );
+          return result.rows[0] ?? null;
+        }
+        if (isLead) {
+          if (leadId) {
+            const result = await client.query(
+              `SELECT id,lead_number AS "leadNumber",organization_name AS "organizationName",contact_name AS "contactName",
+                email,phone,source,stage,estimated_value AS "estimatedValue",currency,consent_status AS "consentStatus",
+                next_follow_up_at AS "nextFollowUpAt",lost_reason AS "lostReason",notes,(SELECT c.id FROM platform.customers c WHERE c.source_lead_id=platform.crm_leads.id) AS "convertedCustomerId",created_at AS "createdAt",updated_at AS "updatedAt"
+               FROM platform.crm_leads WHERE id=$1::uuid`, [leadId],
+            );
+            return { item: result.rows[0] ?? null };
+          }
+          const stage = url.searchParams.get("stage");
+          const values: unknown[] = [`%${q.replace(/[\\%_]/g, "\\$&")}%`];
+          let filter = "($1 = '%%' OR organization_name ILIKE $1 OR contact_name ILIKE $1 OR coalesce(email,'') ILIKE $1)";
+          if (stage && LEAD_STAGES.includes(stage as typeof LEAD_STAGES[number])) { values.push(stage); filter += " AND stage=$2"; }
+          values.push(limit);
+          const result = await client.query(
+            `SELECT id,lead_number AS "leadNumber",organization_name AS "organizationName",contact_name AS "contactName",
+              email,phone,source,stage,estimated_value AS "estimatedValue",currency,consent_status AS "consentStatus",
+              next_follow_up_at AS "nextFollowUpAt",(SELECT c.id FROM platform.customers c WHERE c.source_lead_id=platform.crm_leads.id) AS "convertedCustomerId",created_at AS "createdAt",updated_at AS "updatedAt"
+             FROM platform.crm_leads WHERE ${filter} ORDER BY created_at DESC LIMIT $${values.length}`, values,
+          );
+          return { items: result.rows, limit, returned: result.rows.length };
+        }
+        if (customerId) {
+          const result = await client.query(
+            `SELECT c.id,c.customer_code AS "customerCode",c.legal_name AS "legalName",c.display_name AS "displayName",
+              c.entity_type AS "entityType",c.billing_email AS "billingEmail",c.billing_phone AS "billingPhone",
+              c.billing_address AS "billingAddress",c.status,c.tenant_id AS "organizationId",
+              o.name AS "organizationName",o.slug AS "organizationSlug",c.created_at AS "createdAt",c.updated_at AS "updatedAt"
+             FROM platform.customers c LEFT JOIN core.organizations o ON o.id=c.tenant_id WHERE c.id=$1::uuid`, [customerId],
+          );
+          return { item: result.rows[0] ?? null };
+        }
+        const result = await client.query(
+          `SELECT c.id,c.customer_code AS "customerCode",c.legal_name AS "legalName",c.display_name AS "displayName",
+            c.entity_type AS "entityType",c.billing_email AS "billingEmail",c.billing_phone AS "billingPhone",c.status,
+            c.tenant_id AS "organizationId",o.name AS "organizationName",o.slug AS "organizationSlug",
+            c.created_at AS "createdAt",c.updated_at AS "updatedAt"
+           FROM platform.customers c LEFT JOIN core.organizations o ON o.id=c.tenant_id
+           WHERE ($1='%%' OR c.legal_name ILIKE $1 OR c.display_name ILIKE $1 OR c.customer_code ILIKE $1)
+           ORDER BY c.created_at DESC LIMIT $2`,
+          [`%${q.replace(/[\\%_]/g, "\\$&")}%`, limit],
+        );
+        return { items: result.rows, limit, returned: result.rows.length };
+      });
+      if (scoped.forbidden) { reply(res, 403, { error: "platform_super_admin_required" }); return true; }
+      if (!scoped.value) { reply(res, 503, { error: "platform_erp_unavailable" }); return true; }
+      if (scoped.value && typeof scoped.value === "object" && "item" in scoped.value && !scoped.value.item) { reply(res, 404, { error: isLead ? "lead_not_found" : "customer_not_found" }); return true; }
+      reply(res, 200, { data: scoped.value });
+    } catch (error) {
+      reply(res, errorCode(error) === "42P01" ? 503 : 500, { error: "platform_erp_read_failed" });
+    }
+    return true;
+  }
+
+  if (req.method === "PATCH" && customerId && isCustomer) {
+    const body = await readJson(req);
+    if (!body || Object.keys(body).length !== 1 || typeof body.organizationId !== "string" || !UUID.test(body.organizationId)) {
+      reply(res, 422, { error: "organization_link_requires_valid_organization_id" }); return true;
+    }
+    const organizationId = body.organizationId;
+    try {
+      const scoped = await withAdmin(pool, userId, async (client) => {
+        const existing = await client.query<{ id: string; organizationId: string | null }>(
+          `SELECT id,tenant_id AS "organizationId" FROM platform.customers WHERE id=$1::uuid FOR UPDATE`, [customerId],
+        );
+        const current = existing.rows[0];
+        if (!current) return { error: "customer_not_found" as const };
+        if (current.organizationId) {
+          if (current.organizationId === organizationId) return { id: current.id, organizationId: current.organizationId, alreadyLinked: true };
+          return { error: "customer_already_linked" as const };
+        }
+        const organization = await client.query<{ id: string; name: string; slug: string }>(
+          `SELECT id,name,slug FROM core.organizations WHERE id=$1::uuid`, [organizationId],
+        );
+        if (!organization.rows[0]) return { error: "organization_not_found" as const };
+        const linked = await client.query(
+          "SELECT id FROM platform.customers WHERE tenant_id=$1::uuid LIMIT 1", [organizationId],
+        );
+        if (linked.rows[0]) return { error: "organization_already_linked" as const };
+        const updated = await client.query(
+          `UPDATE platform.customers SET tenant_id=$2::uuid,updated_at=now()
+           WHERE id=$1::uuid
+           RETURNING id,tenant_id AS "organizationId"`, [customerId, organizationId],
+        );
+        const row = updated.rows[0] as { id: string; organizationId: string } | undefined;
+        if (!row) throw new Error("customer_link_update_failed");
+        await audit(client, userId, "crm.customer.organization_linked", "customer", customerId, { organizationId });
+        return row;
+      });
+      if (scoped.forbidden) { reply(res, 403, { error: "platform_super_admin_required" }); return true; }
+      const value = scoped.value as { error?: string } | undefined;
+      if (value?.error === "customer_not_found" || value?.error === "organization_not_found") { reply(res, 404, { error: value.error }); return true; }
+      if (value?.error === "customer_already_linked" || value?.error === "organization_already_linked") { reply(res, 409, { error: value.error }); return true; }
+      reply(res, 200, { data: scoped.value });
+    } catch (error) {
+      const code = errorCode(error);
+      reply(res, code === "23505" ? 409 : code === "42P01" ? 503 : 500, { error: code === "23505" ? "organization_already_linked" : "customer_organization_link_failed" });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && leadConversionId) {
+    const body = await readJson(req);
+    if (!body) { reply(res, 400, { error: "invalid_json_or_body_too_large" }); return true; }
+    const invalid = validateCustomerInput(body);
+    if (invalid) { reply(res, 422, { error: invalid }); return true; }
+    try {
+      const scoped = await withAdmin(pool, userId, async (client) => {
+        const leadResult = await client.query<{ id: string; stage: string; organizationName: string; email: string | null; phone: string | null }>(
+          `SELECT id,stage,organization_name AS "organizationName",email,phone
+           FROM platform.crm_leads WHERE id=$1::uuid FOR UPDATE`, [leadConversionId],
+        );
+        const lead = leadResult.rows[0];
+        if (!lead) return { error: "lead_not_found" as const };
+        const prior = await client.query<{ id: string; customerCode: string; organizationId: string | null }>(
+          `SELECT id,customer_code AS "customerCode",tenant_id AS "organizationId"
+           FROM platform.customers WHERE source_lead_id=$1::uuid`, [leadConversionId],
+        );
+        if (prior.rows[0]) return { alreadyConverted: true as const, customer: prior.rows[0] };
+        if (lead.stage !== "won") return { error: "lead_not_won" as const };
+
+        const organizationId = typeof body.organizationId === "string" ? body.organizationId : null;
+        if (organizationId) {
+          const organization = await client.query("SELECT id FROM core.organizations WHERE id=$1::uuid", [organizationId]);
+          if (!organization.rows[0]) return { error: "organization_not_found" as const };
+          const linked = await client.query("SELECT id FROM platform.customers WHERE tenant_id=$1::uuid LIMIT 1", [organizationId]);
+          if (linked.rows[0]) return { error: "organization_already_linked" as const };
+        }
+
+        const customerCode = `CUS-${new Date().toISOString().slice(0,10).replace(/-/g,"")}-${randomUUID().slice(0,8).toUpperCase()}`;
+        const inserted = await client.query(
+          `INSERT INTO platform.customers
+            (customer_code,legal_name,display_name,entity_type,billing_email,billing_phone,billing_address,status,
+             source_lead_id,account_owner_user_id,tenant_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,'prospect',$8::uuid,$9::uuid,$10::uuid)
+           RETURNING id,customer_code AS "customerCode",legal_name AS "legalName",display_name AS "displayName",
+            status,source_lead_id AS "sourceLeadId",tenant_id AS "organizationId",created_at AS "createdAt"`,
+          [customerCode,String(body.legalName).trim(),String(body.displayName).trim(),body.entityType ?? "institution",
+           body.billingEmail ? String(body.billingEmail).trim().toLowerCase() : lead.email,
+           body.billingPhone ?? lead.phone,JSON.stringify(body.billingAddress ?? {}),leadConversionId,userId,organizationId],
+        );
+        const customer = inserted.rows[0] as { id: string; customerCode: string } | undefined;
+        if (!customer) throw new Error("lead_conversion_customer_insert_failed");
+        await audit(client,userId,"crm.lead.converted","crm_lead",leadConversionId,{customerId:customer.id});
+        await audit(client,userId,"crm.customer.created_from_lead","customer",customer.id,{leadId:leadConversionId,organizationId});
+        return { alreadyConverted: false as const, customer };
+      });
+      if (scoped.forbidden) { reply(res, 403, { error: "platform_super_admin_required" }); return true; }
+      const value = scoped.value as { error?: string; alreadyConverted?: boolean } | undefined;
+      if (value?.error === "lead_not_found" || value?.error === "organization_not_found") { reply(res, 404, { error: value.error }); return true; }
+      if (value?.error === "lead_not_won" || value?.error === "organization_already_linked") { reply(res, 409, { error: value.error }); return true; }
+      reply(res, value?.alreadyConverted ? 200 : 201, { data: scoped.value });
+    } catch (error) {
+      const code = errorCode(error);
+      const constraint = error && typeof error === "object" && "constraint" in error ? String((error as { constraint?: unknown }).constraint ?? "") : "";
+      const conflict = constraint === "platform_customers_one_per_source_lead" ? "lead_already_converted" : constraint === "platform_customers_one_per_tenant" ? "organization_already_linked" : "customer_conversion_conflict";
+      reply(res, code === "23505" ? 409 : code === "42P01" ? 503 : 500, { error: code === "23505" ? conflict : "lead_conversion_failed" });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && !leadId && !customerId && !isMetrics) {
+    const body = await readJson(req);
+    if (!body) { reply(res, 400, { error: "invalid_json_or_body_too_large" }); return true; }
+    const invalid = isLead ? validateLeadInput(body) : validateCustomerInput(body);
+    if (invalid) { reply(res, 422, { error: invalid }); return true; }
+    try {
+      const scoped = await withAdmin(pool, userId, async (client) => {
+        if (isLead) {
+          const leadNumber = `LD-${new Date().toISOString().slice(0,10).replace(/-/g,"")}-${randomUUID().slice(0,8).toUpperCase()}`;
+          const result = await client.query(
+            `INSERT INTO platform.crm_leads
+              (lead_number,organization_name,contact_name,email,phone,source,stage,estimated_value,currency,consent_status,notes,lost_reason,owner_user_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::uuid)
+             RETURNING id,lead_number AS "leadNumber",organization_name AS "organizationName",contact_name AS "contactName",
+              email,phone,source,stage,estimated_value AS "estimatedValue",currency,consent_status AS "consentStatus",
+              notes,created_at AS "createdAt"`,
+            [leadNumber,String(body.organizationName).trim(),String(body.contactName).trim(),body.email ? String(body.email).trim().toLowerCase() : null,
+             body.phone ?? null,body.source ? String(body.source).trim() : "manual",body.stage ?? "new",body.estimatedValue ?? null,
+             body.currency ?? "IDR",body.consentStatus ?? "unknown",body.notes ?? null,body.lostReason ?? null,userId],
+          );
+          const row = result.rows[0] as { id: string } | undefined;
+          if (!row) throw new Error("lead_insert_failed");
+          await audit(client,userId,"crm.lead.created","crm_lead",row.id,{stage:body.stage ?? "new",source:body.source ?? "manual"});
+          return row;
+        }
+        const customerCode = `CUS-${new Date().toISOString().slice(0,10).replace(/-/g,"")}-${randomUUID().slice(0,8).toUpperCase()}`;
+        const organizationId = typeof body.organizationId === "string" ? body.organizationId : null;
+        if (organizationId) {
+          const organization = await client.query("SELECT id FROM core.organizations WHERE id=$1::uuid", [organizationId]);
+          if (!organization.rows[0]) return { error: "organization_not_found" as const };
+          const linked = await client.query("SELECT id FROM platform.customers WHERE tenant_id=$1::uuid LIMIT 1", [organizationId]);
+          if (linked.rows[0]) return { error: "organization_already_linked" as const };
+        }
+        const result = await client.query(
+          `INSERT INTO platform.customers
+            (customer_code,legal_name,display_name,entity_type,billing_email,billing_phone,billing_address,status,account_owner_user_id,tenant_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,'prospect',$8::uuid,$9::uuid)
+           RETURNING id,customer_code AS "customerCode",legal_name AS "legalName",display_name AS "displayName",
+            entity_type AS "entityType",billing_email AS "billingEmail",billing_phone AS "billingPhone",billing_address AS "billingAddress",
+            tenant_id AS "organizationId",status,created_at AS "createdAt"`,
+          [customerCode,String(body.legalName).trim(),String(body.displayName).trim(),body.entityType ?? "institution",
+           body.billingEmail ? String(body.billingEmail).trim().toLowerCase() : null,body.billingPhone ?? null,
+           JSON.stringify(body.billingAddress ?? {}),userId,organizationId],
+        );
+        const row = result.rows[0] as { id: string } | undefined;
+        if (!row) throw new Error("customer_insert_failed");
+        await audit(client,userId,"crm.customer.created","customer",row.id,{entityType:body.entityType ?? "institution",organizationId});
+        return row;
+      });
+      if (scoped.forbidden) { reply(res, 403, { error: "platform_super_admin_required" }); return true; }
+      const value = scoped.value as { error?: string } | undefined;
+      if (value?.error === "organization_not_found") { reply(res, 404, { error: value.error }); return true; }
+      if (value?.error === "organization_already_linked") { reply(res, 409, { error: value.error }); return true; }
+      reply(res, 201, { data: scoped.value });
+    } catch (error) {
+      const code = errorCode(error);
+      const constraint = error && typeof error === "object" && "constraint" in error ? String((error as { constraint?: unknown }).constraint ?? "") : "";
+      const conflictError = constraint === "platform_customers_one_per_tenant" ? "organization_already_linked" : "duplicate_platform_record";
+      reply(res, code === "23505" ? 409 : code === "42P01" ? 503 : 500, { error: code === "23505" ? conflictError : "platform_erp_create_failed" });
+    }
+    return true;
+  }
+
+  if (req.method === "PATCH" && leadId && isLead) {
+    const body = await readJson(req);
+    if (!body || Object.keys(body).length === 0) { reply(res, 400, { error: "invalid_json_or_empty_update" }); return true; }
+    const allowed = new Set(["stage","nextFollowUpAt","estimatedValue","notes","lostReason","consentStatus"]);
+    if (Object.keys(body).some(key => !allowed.has(key))) { reply(res, 422, { error: "unsupported_lead_update_field" }); return true; }
+    if (body.stage !== undefined && !LEAD_STAGES.includes(body.stage as typeof LEAD_STAGES[number])) { reply(res, 422, { error: "invalid_lead_stage" }); return true; }
+    if (body.consentStatus !== undefined && !["unknown","granted","withdrawn","not_required"].includes(String(body.consentStatus))) { reply(res, 422, { error: "invalid_consent_status" }); return true; }
+    if (body.estimatedValue !== undefined && body.estimatedValue !== null && (typeof body.estimatedValue !== "number" || !Number.isFinite(body.estimatedValue) || body.estimatedValue < 0)) { reply(res, 422, { error: "invalid_estimated_value" }); return true; }
+    if (body.notes !== undefined && body.notes !== null && (typeof body.notes !== "string" || body.notes.length > 5000)) { reply(res, 422, { error: "invalid_notes" }); return true; }
+    if (body.lostReason !== undefined && body.lostReason !== null && (typeof body.lostReason !== "string" || body.lostReason.length > 1000)) { reply(res, 422, { error: "invalid_lost_reason" }); return true; }
+    if (body.nextFollowUpAt !== undefined && body.nextFollowUpAt !== null && (typeof body.nextFollowUpAt !== "string" || !Number.isFinite(Date.parse(body.nextFollowUpAt)))) { reply(res, 422, { error: "invalid_next_follow_up_at" }); return true; }
+    try {
+      const scoped = await withAdmin(pool,userId,async client => {
+        const fields: Array<[string,string]> = [["stage","stage"],["nextFollowUpAt","next_follow_up_at"],["estimatedValue","estimated_value"],["notes","notes"],["lostReason","lost_reason"],["consentStatus","consent_status"]];
+        const values: unknown[]=[leadId]; const sets:string[]=[];
+        for(const [key,column] of fields) if(Object.hasOwn(body,key)){values.push(body[key]);sets.push(`${column}=$${values.length}${key==="nextFollowUpAt"?"::timestamptz":""}`);}
+        sets.push("updated_at=now()");
+        const result=await client.query(
+          `UPDATE platform.crm_leads SET ${sets.join(",")} WHERE id=$1::uuid
+           RETURNING id,lead_number AS "leadNumber",organization_name AS "organizationName",contact_name AS "contactName",
+            email,phone,source,stage,estimated_value AS "estimatedValue",currency,consent_status AS "consentStatus",
+            next_follow_up_at AS "nextFollowUpAt",lost_reason AS "lostReason",notes,updated_at AS "updatedAt"`,values);
+        const row=result.rows[0] as {id:string}|undefined;
+        if(row) await audit(client,userId,"crm.lead.updated","crm_lead",row.id,{changedFields:Object.keys(body)});
+        return row ?? null;
+      });
+      if(scoped.forbidden){reply(res,403,{error:"platform_super_admin_required"});return true;}
+      if(!scoped.value){reply(res,404,{error:"lead_not_found"});return true;}
+      reply(res,200,{data:scoped.value});
+    } catch { reply(res,500,{error:"lead_update_failed"}); }
+    return true;
+  }
+  reply(res, 405, { error: "method_not_allowed" });
+  return true;
+}
